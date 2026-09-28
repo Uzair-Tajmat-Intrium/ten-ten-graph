@@ -1,0 +1,134 @@
+# Product master (PIM) semantic model — upload via Connections → Register semantic
+# model (BigQuery connection), with NO dataset/relationship bindings.
+# `verified_queries` is a house extension (context-graph parse_ossie), not Ossie spec.
+version: "1.0"
+name: core_product_semantic_model
+description: >-
+  ten-ten product master: one row per SKU with cost, price, shelf life and taxonomy,
+  per-channel commercial terms, and listing / claim compliance. Static PIM data in
+  gen-lang-client-0520145261.ctx_upside_master_data.
+
+datasets:
+  - name: product
+    description: One row per SKU — catalogue, cost, price, shelf life, category and product line.
+    source: gen-lang-client-0520145261.ctx_upside_master_data.V_PRODUCT_ENRICHED
+    primary_key: [SKU]
+    fields:
+      - {name: SKU, description: Product SKU id, expression: {dialects: [{dialect: ANSI_SQL, expression: SKU}]}}
+      - {name: DISPLAY_NAME, description: Product name, expression: {dialects: [{dialect: ANSI_SQL, expression: DISPLAY_NAME}]}}
+      - {name: CATEGORY_NAME, description: Product category, expression: {dialects: [{dialect: ANSI_SQL, expression: CATEGORY_NAME}]}}
+      - {name: PRODUCT_LINE_NAME, description: Product line, expression: {dialects: [{dialect: ANSI_SQL, expression: PRODUCT_LINE_NAME}]}}
+      - {name: FLAVOUR, expression: {dialects: [{dialect: ANSI_SQL, expression: FLAVOUR}]}}
+      - {name: SIZE_LABEL, description: Pack size label, expression: {dialects: [{dialect: ANSI_SQL, expression: SIZE_LABEL}]}}
+      - {name: STATUS, description: Product lifecycle status, expression: {dialects: [{dialect: ANSI_SQL, expression: STATUS}]}}
+      - {name: IS_ACTIVE, description: TRUE for SKUs currently sold, expression: {dialects: [{dialect: ANSI_SQL, expression: IS_ACTIVE}]}}
+      - {name: VEG_NONVEG, expression: {dialects: [{dialect: ANSI_SQL, expression: VEG_NONVEG}]}}
+      - {name: MRP_INR, description: Maximum retail price (INR), expression: {dialects: [{dialect: ANSI_SQL, expression: MRP_INR}]}}
+      - {name: BASE_PRICE_INR, description: Base price before GST (INR), expression: {dialects: [{dialect: ANSI_SQL, expression: BASE_PRICE_INR}]}}
+      - {name: TOTAL_COGS_INR, description: Unit cost of goods sold (INR), expression: {dialects: [{dialect: ANSI_SQL, expression: TOTAL_COGS_INR}]}}
+      - {name: SHELF_LIFE_DAYS, description: Shelf life in days, expression: {dialects: [{dialect: ANSI_SQL, expression: SHELF_LIFE_DAYS}]}}
+
+  - name: product_channel
+    description: Per-(SKU, channel) commercial terms. Grain is SKU x channel, not SKU.
+    source: gen-lang-client-0520145261.ctx_upside_master_data.MAP_PRODUCT_CHANNEL
+    primary_key: [SKU, CHANNEL_ID]
+    fields:
+      - {name: SKU, expression: {dialects: [{dialect: ANSI_SQL, expression: SKU}]}}
+      - {name: CHANNEL_ID, expression: {dialects: [{dialect: ANSI_SQL, expression: CHANNEL_ID}]}}
+      - {name: APPLICABLE, description: Whether the SKU is sold on this channel, expression: {dialects: [{dialect: ANSI_SQL, expression: APPLICABLE}]}}
+      - {name: CHANNEL_MRP_INR, expression: {dialects: [{dialect: ANSI_SQL, expression: CHANNEL_MRP_INR}]}}
+      - {name: CHANNEL_BASE_PRICE_INR, expression: {dialects: [{dialect: ANSI_SQL, expression: CHANNEL_BASE_PRICE_INR}]}}
+      - {name: CHANNEL_COGS_INR, expression: {dialects: [{dialect: ANSI_SQL, expression: CHANNEL_COGS_INR}]}}
+      - {name: CHANNEL_SHELF_LIFE_DAYS, expression: {dialects: [{dialect: ANSI_SQL, expression: CHANNEL_SHELF_LIFE_DAYS}]}}
+      - {name: PRIMARY_SALES_OWNER, expression: {dialects: [{dialect: ANSI_SQL, expression: PRIMARY_SALES_OWNER}]}}
+
+  - name: channel
+    description: Sales channels (Swiggy, Zomato, Blinkit, D2C, ...).
+    source: gen-lang-client-0520145261.ctx_upside_master_data.DIM_CHANNEL
+    primary_key: [CHANNEL_ID]
+    fields:
+      - {name: CHANNEL_ID, expression: {dialects: [{dialect: ANSI_SQL, expression: CHANNEL_ID}]}}
+      - {name: CHANNEL_NAME, expression: {dialects: [{dialect: ANSI_SQL, expression: CHANNEL_NAME}]}}
+      - {name: CHANNEL_TYPE, expression: {dialects: [{dialect: ANSI_SQL, expression: CHANNEL_TYPE}]}}
+
+  - name: listing
+    description: Per-SKU FSSAI / marketplace listing readiness. BLOCKING_GAPS = '' means publishable.
+    source: gen-lang-client-0520145261.ctx_upside_master_data.V_LISTING_PACKAGE
+    primary_key: [SKU]
+    fields:
+      - {name: SKU, expression: {dialects: [{dialect: ANSI_SQL, expression: SKU}]}}
+      - {name: IS_ACTIVE, expression: {dialects: [{dialect: ANSI_SQL, expression: IS_ACTIVE}]}}
+      - {name: BLOCKING_GAPS, description: Semicolon-separated gaps that block listing; empty when none, expression: {dialects: [{dialect: ANSI_SQL, expression: BLOCKING_GAPS}]}}
+      - {name: WARNING_GAPS, expression: {dialects: [{dialect: ANSI_SQL, expression: WARNING_GAPS}]}}
+      - {name: ALLERGEN_UNDERDECLARED, description: Allergen the recipe implies but the label under-declares; NULL when none, expression: {dialects: [{dialect: ANSI_SQL, expression: ALLERGEN_UNDERDECLARED}]}}
+      - {name: MANDATORY_NUTRIENTS_BLANK, description: FSSAI-mandatory nutrients left blank; NULL when none, expression: {dialects: [{dialect: ANSI_SQL, expression: MANDATORY_NUTRIENTS_BLANK}]}}
+      - {name: INGREDIENT_SOURCE, expression: {dialects: [{dialect: ANSI_SQL, expression: INGREDIENT_SOURCE}]}}
+      - {name: NUTRIENT_BASIS, expression: {dialects: [{dialect: ANSI_SQL, expression: NUTRIENT_BASIS}]}}
+
+  - name: claim_check
+    description: Every on-pack claim with its lab-panel verdict.
+    source: gen-lang-client-0520145261.ctx_upside_master_data.V_LISTING_CLAIM_CHECK
+    primary_key: [CLAIM_ID]
+    fields:
+      - {name: CLAIM_ID, expression: {dialects: [{dialect: ANSI_SQL, expression: CLAIM_ID}]}}
+      - {name: SKU, expression: {dialects: [{dialect: ANSI_SQL, expression: SKU}]}}
+      - {name: CLAIM_TEXT, expression: {dialects: [{dialect: ANSI_SQL, expression: CLAIM_TEXT}]}}
+      - {name: CLAIM_KIND, expression: {dialects: [{dialect: ANSI_SQL, expression: CLAIM_KIND}]}}
+      - {name: NUTRIENT, expression: {dialects: [{dialect: ANSI_SQL, expression: NUTRIENT}]}}
+      - {name: DEVIATION_PCT, expression: {dialects: [{dialect: ANSI_SQL, expression: DEVIATION_PCT}]}}
+      - {name: VERDICT, description: "substantiated, or MISMATCH / CONTRADICTED / MALFORMED_CLAIM", expression: {dialects: [{dialect: ANSI_SQL, expression: VERDICT}]}}
+
+relationships:
+  - {name: product_channel_to_product, from: product_channel, to: product, from_columns: [SKU], to_columns: [SKU]}
+  - {name: product_channel_to_channel, from: product_channel, to: channel, from_columns: [CHANNEL_ID], to_columns: [CHANNEL_ID]}
+  - {name: listing_to_product, from: listing, to: product, from_columns: [SKU], to_columns: [SKU]}
+  - {name: claim_check_to_product, from: claim_check, to: product, from_columns: [SKU], to_columns: [SKU]}
+
+metrics:
+  - name: average_cogs
+    description: Average unit COGS across active SKUs (INR)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "ROUND(AVG(CASE WHEN product.IS_ACTIVE THEN product.TOTAL_COGS_INR END), 2)"}]}
+  - name: max_shelf_life
+    description: Longest shelf life across active SKUs (days)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "MAX(CASE WHEN product.IS_ACTIVE THEN product.SHELF_LIFE_DAYS END)"}]}
+  - name: active_sku_count
+    description: SKUs currently sold
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "SUM(CASE WHEN product.IS_ACTIVE THEN 1 ELSE 0 END)"}]}
+  - name: portfolio_gross_margin_pct
+    description: (MRP - COGS) / MRP across active SKUs, revenue-weighted (%)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "ROUND(SUM(CASE WHEN product.IS_ACTIVE AND product.MRP_INR > 0 THEN product.MRP_INR - product.TOTAL_COGS_INR ELSE 0 END) * 100.0 / NULLIF(SUM(CASE WHEN product.IS_ACTIVE AND product.MRP_INR > 0 THEN product.MRP_INR ELSE 0 END), 0), 1)"}]}
+  - name: listing_ready_share_pct
+    description: Share of active SKUs with no blocking listing gap (%)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "ROUND(SUM(CASE WHEN listing.IS_ACTIVE AND listing.BLOCKING_GAPS = '' THEN 1 ELSE 0 END) * 100.0 / NULLIF(SUM(CASE WHEN listing.IS_ACTIVE THEN 1 ELSE 0 END), 0), 1)"}]}
+  - name: allergen_underdeclaration_rate_pct
+    description: Share of active SKUs whose label under-declares a recipe allergen (%)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "ROUND(SUM(CASE WHEN listing.IS_ACTIVE AND listing.ALLERGEN_UNDERDECLARED IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(SUM(CASE WHEN listing.IS_ACTIVE THEN 1 ELSE 0 END), 0), 1)"}]}
+  - name: mandatory_nutrient_completeness_pct
+    description: Share of active SKUs with no FSSAI-mandatory nutrient blank (%)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "ROUND(SUM(CASE WHEN listing.IS_ACTIVE AND listing.MANDATORY_NUTRIENTS_BLANK IS NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(SUM(CASE WHEN listing.IS_ACTIVE THEN 1 ELSE 0 END), 0), 1)"}]}
+  - name: claim_substantiation_rate_pct
+    description: Share of on-pack claims the lab panel supports (%), claim-weighted
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "ROUND(SUM(CASE WHEN claim_check.VERDICT = 'substantiated' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(claim_check.CLAIM_ID), 0), 1)"}]}
+  - name: contradicted_claim_count
+    description: Claims the lab panel contradicts outright
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "SUM(CASE WHEN claim_check.VERDICT IN ('MISMATCH', 'CONTRADICTED', 'MALFORMED_CLAIM') THEN 1 ELSE 0 END)"}]}
+
+verified_queries:
+  # idea_capture_triage `portfolio_products` — mints the Product cards on Full Context.
+  - name: active_products
+    question: Every active SKU with its name, description and status
+    sql: |
+      SELECT SKU, DISPLAY_NAME, DESCRIPTION, STATUS
+      FROM `gen-lang-client-0520145261.ctx_upside_master_data.V_PRODUCT_ENRICHED`
+      WHERE IS_ACTIVE
+      ORDER BY SKU
+      LIMIT 200
+  # product_cost_margin_review `cost_margin_snapshot`.
+  - name: cost_shelf_life_snapshot
+    question: What is the average cost of goods sold and the maximum shelf life across active products?
+    sql: |
+      SELECT COUNT(*) AS active_skus,
+             ROUND(AVG(TOTAL_COGS_INR), 2) AS average_cogs_inr,
+             MAX(SHELF_LIFE_DAYS) AS max_shelf_life_days
+      FROM `gen-lang-client-0520145261.ctx_upside_master_data.V_PRODUCT_ENRICHED`
+      WHERE IS_ACTIVE

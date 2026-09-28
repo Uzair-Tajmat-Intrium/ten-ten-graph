@@ -56,12 +56,12 @@ processes:
         type: agent
         description: Summarise what the current label declares and capture its Google Drive artwork link.
         instruction: >
-          From product_label_facts, summarise the SKU's current on-pack declarations
-          (name, veg/non-veg, serving size, MRP, shelf life, barcode, labelling
-          compliance status). For the artwork: read IMAGES_LINK — this is the Google
+          From the SKU's label facts (name, veg_nonveg, serving_size, mrp_inr,
+          shelf_life_days, gs1_barcode, org_labelling_compliance), summarise its
+          current on-pack declarations. For the artwork: read images_link — this is the Google
           Drive location of the label artwork (a Drive file URL, a Drive folder URL,
-          or a bare file id). Output drive_label_link set to the IMAGES_LINK value
-          verbatim (an empty string if IMAGES_LINK is absent); it is kept for
+          or a bare file id). Output drive_label_link set to the images_link value
+          verbatim (an empty string if images_link is absent); it is kept for
           display/audit. The label file itself is downloaded from Google Drive in the
           NEXT step (download_label_from_drive) via the google-drive skill. Output
           label_facts (a concise structured summary) and drive_label_link.
@@ -168,7 +168,7 @@ processes:
         description: The label file could not be downloaded from Drive — reviewer retries or proceeds.
         instruction: >
           The current label artwork could NOT be downloaded from the on-record Google Drive
-          link (IMAGES_LINK) — the link may point to an empty or inaccessible folder, the file
+          link (images_link) — the link may point to an empty or inaccessible folder, the file
           may be missing, or access may be denied. This system CANNOT upload files to Google
           Drive — the reviewer must add the label artwork to the SKU's Google Drive folder
           themselves (outside this system), then retry. Recommend "Retry Drive download":
@@ -184,7 +184,7 @@ processes:
           - title: Current Label Facts
             summary: What the SKU currently declares (label file not downloadable from Drive).
             views:
-              - { view: table, from: product_label_facts }
+              - { view: markdown, from: label_facts }
 
       # 2. (a) Identify the concrete label edits driven by the regulation/formulation change.
       - id: identify_required_changes
@@ -197,7 +197,7 @@ processes:
         description: Derive the field-level label edits required by the change.
         instruction: >
           Produce a concrete, field-level list of label edits to make on this SKU.
-          Reason over: (a) product_label_facts and label_facts (current on-pack
+          Reason over: (a) the SKU's label facts and label_facts (current on-pack
           declarations); (b) GATHERED CONTEXT — the SKU's related graph entities
           (allergens, ingredients, nutrients, claims) when present; (c) the
           FSSAI packaged-food mandatory declarations that every label must carry;
@@ -452,33 +452,18 @@ processes:
       # pass, so those upstream produces must have run.
       run_steps_before_gate: true
 
-      # Pre-fetch the SKU's enriched label facts (dataset query, scoped to the
-      # Product on the event) so the agent steps reason over real data.
+      # The SKU's on-pack facts are master data the resolved Product node already
+      # carries (pim_bq maps them from V_PRODUCT_ENRICHED), so each is a `source: graph`
+      # key — the key name matches the entity property. No warehouse read at all.
       context_package:
-        - key: product_label_facts
-          source: dataset
-          query:
-            entity: product
-            dataset: V_PRODUCT_ENRICHED
-            columns:
-              - SKU
-              - DISPLAY_NAME
-              - VEG_NONVEG
-              - SERVING_SIZE
-              - MRP_INR
-              - SHELF_LIFE_DAYS
-              - GS1_BARCODE
-              - ORG_LABELLING_COMPLIANCE
-              - IMAGES_LINK
-            limit: 1
-
-        # The SKU's label-artwork Drive FOLDER link lives on the resolved Product
-        # entity as the `images_link` property — populated on every tenant with NO
-        # dataset link required. (Sourcing it from the DIM_PRODUCT / V_PRODUCT_ENRICHED
-        # datasets left it EMPTY on tenants where those datasets aren't linked, so the
-        # Drive read agent had no real folder id and copied the literal "FOLDER_ID"
-        # placeholder from its instructions into the search query.) `source: graph`
-        # matches the key name to the entity property, so this returns the real URL.
+        - { key: name, source: graph }
+        - { key: veg_nonveg, source: graph }
+        - { key: serving_size, source: graph }
+        - { key: mrp_inr, source: graph }
+        - { key: shelf_life_days, source: graph }
+        - { key: gs1_barcode, source: graph }
+        - { key: org_labelling_compliance, source: graph }
+        # The label-artwork Drive FOLDER link (read by the download steps).
         - key: images_link
           source: graph
 
@@ -491,9 +476,7 @@ processes:
         - title: Product Label Facts
           summary: Current on-pack declarations for the SKU under review.
           views:
-            - view: table
-              from: product_label_facts
-              columns: [SKU, DISPLAY_NAME, VEG_NONVEG, SERVING_SIZE, MRP_INR, SHELF_LIFE_DAYS, ORG_LABELLING_COMPLIANCE]
+            - { view: markdown, from: label_facts }
 
       # Tool scope: the agent's DECISION gates don't call skills/connectors at all — the
       # only skill use is in the hard-wired STEPS (download_label_from_drive via the

@@ -1,0 +1,79 @@
+version: 1
+
+# KPIs = metrics published by the OSI semantic models (semantic_models/*.osi.yaml,
+# uploaded via Connections). This file only adds target / unit / owner, and names the
+# ones goals and process `related_kpis` bind to. The formula lives in the model:
+# `semantic_field: <dataset>.<metric>`. An `id` equals its metric name, so this entry
+# replaces the auto-derived one. Targets ported from the pre-OSI KPIs.
+
+kpis:
+  # ---- Inventory freshness (inventory_freshness_semantic_model) ----------------
+  - id: near_expiry_units
+    name: Near-Expiry Units
+    description: Sellable units in batches expiring within 3 days, latest snapshot.
+    owner: supply_chain_team
+    applies_to: Store
+    unit: units
+    target: { value: 0, comparison: lte }
+    computed_by: { semantic_model: inventory_freshness_semantic_model, semantic_field: stock_risk.near_expiry_units }
+    refresh: { cache_ttl: 6h }
+
+  - id: expiry_value_at_risk_inr
+    name: Expiry Value at Risk (INR)
+    description: Near-expiry units priced at unit COGS — the rupee cost of stock about to be binned.
+    owner: supply_chain_team
+    applies_to: Store
+    unit: inr
+    target: { value: 25000, comparison: lte }
+    computed_by: { semantic_model: inventory_freshness_semantic_model, semantic_field: stock_risk.expiry_value_at_risk_inr }
+    refresh: { cache_ttl: 6h }
+
+  - id: low_stock_pair_share_pct
+    name: Low-Stock Incidence Rate
+    description: Share of (store, SKU) pairs at or below their configured safety stock.
+    owner: supply_chain_team
+    applies_to: Store
+    unit: percentage
+    target: { value: 5, comparison: lte }
+    computed_by: { semantic_model: inventory_freshness_semantic_model, semantic_field: stock_risk.low_stock_pair_share_pct }
+    refresh: { cache_ttl: 6h }
+
+  - id: critical_low_pairs
+    name: Critically-Low (SKU, store) Pairs
+    description: Pairs at or under the hard low-stock floor, not just the reorder point.
+    owner: supply_chain_team
+    applies_to: Store
+    unit: count
+    target: { value: 0, comparison: lte }
+    computed_by: { semantic_model: inventory_freshness_semantic_model, semantic_field: stock_risk.critical_low_pairs }
+    refresh: { cache_ttl: 6h }
+
+  # ---- Portfolio cost & margin (core_product_semantic_model) -------------------
+  - id: portfolio_gross_margin_pct
+    name: Portfolio Gross Margin %
+    description: (MRP - COGS) / MRP across active SKUs, revenue-weighted.
+    owner: portfolio_team
+    applies_to: Product
+    unit: percentage
+    target: { value: 60, comparison: gte }
+    computed_by: { semantic_model: core_product_semantic_model, semantic_field: product.portfolio_gross_margin_pct }
+    refresh: { cache_ttl: 24h }
+
+  # No target yet — the portfolio team has not set one; these report values only.
+  - id: average_cogs
+    name: Average Unit COGS (INR)
+    description: Average unit cost of goods sold across active SKUs.
+    owner: portfolio_team
+    applies_to: Product
+    unit: inr
+    computed_by: { semantic_model: core_product_semantic_model, semantic_field: product.average_cogs }
+    refresh: { cache_ttl: 24h }
+
+  - id: max_shelf_life
+    name: Longest Shelf Life (days)
+    description: Longest shelf life across active SKUs.
+    owner: portfolio_team
+    applies_to: Product
+    unit: days
+    computed_by: { semantic_model: core_product_semantic_model, semantic_field: product.max_shelf_life }
+    refresh: { cache_ttl: 24h }

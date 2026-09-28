@@ -1,0 +1,99 @@
+version: 1
+
+# Goal tree: company goal -> business areas -> what teams work on. Every `kpi` must
+# be in kpis.yaml and every `process` in processes/, or apply fails. A leaf's
+# `processes` binding is what delivers its KPI values into that process's run.
+
+title: Business goals
+description: >-
+  What the business is trying to achieve, who owns each part, and the numbers that
+  show whether it is working — every number read from the OSI semantic models.
+source: ten-ten operating plan
+steward: portfolio_team
+review_cadence: Monthly operating review
+
+goals:
+  # --- company goal ---------------------------------------------------------
+  - id: grow_profitably
+    name: Grow profitably
+    kind: enterprise
+    description: Sell more without wasting stock or shipping non-compliant labels.
+    horizon: FY26
+    owner: executive_leadership
+    contributors: [supply_chain_team, demand_planning_team, compliance_team, portfolio_team]
+
+  # --- business areas -------------------------------------------------------
+  - id: reduce_stock_wastage
+    parent: grow_profitably
+    name: Reduce stock wastage
+    kind: strategic
+    description: Sell short shelf-life stock before it expires, without leaving shelves empty.
+    horizon: FY26
+    owner: supply_chain_team
+    contributors: [demand_planning_team]
+    applies_to: [Product, Store]
+
+  - id: sell_compliant_products
+    parent: grow_profitably
+    name: Sell compliant products
+    kind: strategic
+    description: Every live SKU listable on every channel, with labels the lab panel backs.
+    horizon: FY26
+    owner: compliance_team
+    applies_to: [Product]
+
+  # --- stock wastage --------------------------------------------------------
+  - id: reduce_expiring_stock
+    parent: reduce_stock_wastage
+    name: Reduce expiring stock
+    kind: operational
+    description: Cut the units, and the rupee value, of stock sitting close to its expiry date.
+    horizon: FY26
+    owner: supply_chain_team
+    contributors: [demand_planning_team]
+    applies_to: [Product, Store]
+    kpis:
+      - { kpi: near_expiry_units,        aggregation: sum, cadence: Daily }
+      - { kpi: expiry_value_at_risk_inr, aggregation: sum, cadence: Daily }
+    processes: [shelf_life_risk_monitoring, inventory_optimization]
+
+  - id: avoid_stock_outs
+    parent: reduce_stock_wastage
+    name: Avoid stock-outs
+    kind: operational
+    description: >-
+      Keep enough stock at every store. Ordering less would cut wastage but leave
+      shelves empty, so this is measured alongside it.
+    horizon: FY26
+    owner: supply_chain_team
+    contributors: [demand_planning_team]
+    applies_to: [Product, Store]
+    kpis:
+      - { kpi: low_stock_pair_share_pct, aggregation: avg, cadence: Daily }
+      - { kpi: critical_low_pairs,       aggregation: sum, cadence: Daily }
+    processes: [shelf_life_risk_monitoring, inventory_optimization]
+
+  # --- compliance -----------------------------------------------------------
+  - id: keep_labels_listing_ready
+    parent: sell_compliant_products
+    name: Keep labels listing-ready
+    kind: operational
+    description: Clear the FSSAI / marketplace gaps and label claims the lab panel does not support.
+    horizon: FY26
+    owner: compliance_team
+    applies_to: [Product]
+    processes: [label_compliance_review]
+
+  # --- portfolio ------------------------------------------------------------
+  - id: protect_portfolio_margin
+    parent: grow_profitably
+    name: Protect portfolio margin
+    kind: operational
+    description: Keep unit cost and shelf life moving the right way across the live portfolio.
+    horizon: FY26
+    owner: portfolio_team
+    applies_to: [Product]
+    kpis:
+      - { kpi: portfolio_gross_margin_pct, aggregation: avg, cadence: Monthly }
+      - { kpi: average_cogs,               aggregation: avg, cadence: Monthly }
+      - { kpi: max_shelf_life,             aggregation: max, cadence: Monthly }

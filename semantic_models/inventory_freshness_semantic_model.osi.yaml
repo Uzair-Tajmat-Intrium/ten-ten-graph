@@ -1,0 +1,114 @@
+# Inventory freshness semantic model — upload via Connections → Register semantic
+# model (BigQuery connection), with NO dataset/relationship bindings.
+# Needs V_STORE_STOCK_RISK + V_INVENTORY_PLAN_INPUTS (sql/views.sql).
+# `verified_queries` is a house extension (context-graph parse_ossie), not Ossie spec.
+version: "1.0"
+name: inventory_freshness_semantic_model
+description: >-
+  ten-ten dark-store inventory: per-(store, SKU) stock risk off each store's latest
+  snapshot (near-expiry and low-stock against the configured thresholds), the
+  forecast-vs-stock plan inputs, and the ML demand forecast. Live data in
+  gen-lang-client-0520145261.bronze / gold.
+
+datasets:
+  - name: stock_risk
+    description: >-
+      One row per (store, SKU) with sellable stock on the latest snapshot. Expired
+      batches excluded. risk_type is wastage, low_stock, critical_low, both or ok.
+    source: gen-lang-client-0520145261.bronze.V_STORE_STOCK_RISK
+    primary_key: [STORE_ID, SKU_ID]
+    fields:
+      - {name: STORE_ID, description: Dark-store id, expression: {dialects: [{dialect: ANSI_SQL, expression: STORE_ID}]}}
+      - {name: SKU_ID, description: Product SKU id, expression: {dialects: [{dialect: ANSI_SQL, expression: SKU_ID}]}}
+      - {name: total_available, description: Sellable units on hand, expression: {dialects: [{dialect: ANSI_SQL, expression: total_available}]}}
+      - {name: expiring_qty, description: Units in batches expiring within 3 days, expression: {dialects: [{dialect: ANSI_SQL, expression: expiring_qty}]}}
+      - {name: soonest_expiry, description: Expiry date of the soonest sellable batch, dimension: {is_time: true}, expression: {dialects: [{dialect: ANSI_SQL, expression: soonest_expiry}]}}
+      - {name: days_to_expiry, description: Days until the soonest sellable batch expires, expression: {dialects: [{dialect: ANSI_SQL, expression: days_to_expiry}]}}
+      - {name: batches, description: Sellable batches on hand, expression: {dialects: [{dialect: ANSI_SQL, expression: batches}]}}
+      - {name: min_days_shelf_life, description: Near-expiry threshold (days), expression: {dialects: [{dialect: ANSI_SQL, expression: min_days_shelf_life}]}}
+      - {name: min_count, description: Safety-stock threshold (units), expression: {dialects: [{dialect: ANSI_SQL, expression: min_count}]}}
+      - {name: absolute_risk_count, description: Hard low-stock floor (units), expression: {dialects: [{dialect: ANSI_SQL, expression: absolute_risk_count}]}}
+      - {name: unit_cogs_inr, description: Unit COGS (INR), expression: {dialects: [{dialect: ANSI_SQL, expression: unit_cogs_inr}]}}
+      - {name: risk_type, description: "wastage, low_stock, critical_low, both or ok", expression: {dialects: [{dialect: ANSI_SQL, expression: risk_type}]}}
+
+  - name: inventory_plan
+    description: >-
+      Per-(store, SKU) plan inputs: sellable stock, expiring units, next-3-day latest
+      forecast and the nearest transfer store.
+    source: gen-lang-client-0520145261.bronze.V_INVENTORY_PLAN_INPUTS
+    primary_key: [STORE_ID, SKU_ID]
+    fields:
+      - {name: STORE_ID, expression: {dialects: [{dialect: ANSI_SQL, expression: STORE_ID}]}}
+      - {name: SKU_ID, expression: {dialects: [{dialect: ANSI_SQL, expression: SKU_ID}]}}
+      - {name: available_quantity, description: Sellable units on hand (NULL when only forecast exists), expression: {dialects: [{dialect: ANSI_SQL, expression: available_quantity}]}}
+      - {name: expiring_qty, expression: {dialects: [{dialect: ANSI_SQL, expression: expiring_qty}]}}
+      - {name: soonest_expiry, dimension: {is_time: true}, expression: {dialects: [{dialect: ANSI_SQL, expression: soonest_expiry}]}}
+      - {name: days_to_expiry, expression: {dialects: [{dialect: ANSI_SQL, expression: days_to_expiry}]}}
+      - {name: forecast_3d, description: Latest-run forecast units for the next 1-3 days, expression: {dialects: [{dialect: ANSI_SQL, expression: forecast_3d}]}}
+      - {name: nearest_store_id, description: Closest transfer-route store, expression: {dialects: [{dialect: ANSI_SQL, expression: nearest_store_id}]}}
+      - {name: distance_km, expression: {dialects: [{dialect: ANSI_SQL, expression: distance_km}]}}
+
+  - name: forecast
+    description: ML daily sales forecast per (store, SKU, date); IS_LATEST_FORECAST marks the current run.
+    source: gen-lang-client-0520145261.gold.FORECAST_RESULTS_UPDATE
+    fields:
+      - {name: MASTER_STORE_ID, expression: {dialects: [{dialect: ANSI_SQL, expression: MASTER_STORE_ID}]}}
+      - {name: SKU_ID, expression: {dialects: [{dialect: ANSI_SQL, expression: SKU_ID}]}}
+      - {name: FORECAST_DATE, dimension: {is_time: true}, expression: {dialects: [{dialect: ANSI_SQL, expression: FORECAST_DATE}]}}
+      - {name: DAYS_AHEAD, expression: {dialects: [{dialect: ANSI_SQL, expression: DAYS_AHEAD}]}}
+      - {name: PREDICTED_SALES_QUANTITY, expression: {dialects: [{dialect: ANSI_SQL, expression: PREDICTED_SALES_QUANTITY}]}}
+      - {name: LOWER_BOUND, expression: {dialects: [{dialect: ANSI_SQL, expression: LOWER_BOUND}]}}
+      - {name: UPPER_BOUND, expression: {dialects: [{dialect: ANSI_SQL, expression: UPPER_BOUND}]}}
+      - {name: IS_LATEST_FORECAST, expression: {dialects: [{dialect: ANSI_SQL, expression: IS_LATEST_FORECAST}]}}
+
+  - name: store
+    description: Dark-store master.
+    source: gen-lang-client-0520145261.bronze.MASTER_STORE
+    primary_key: [MASTER_STORE_ID]
+    fields:
+      - {name: MASTER_STORE_ID, expression: {dialects: [{dialect: ANSI_SQL, expression: MASTER_STORE_ID}]}}
+      - {name: STORE_NAME, expression: {dialects: [{dialect: ANSI_SQL, expression: STORE_NAME}]}}
+      - {name: CITY, expression: {dialects: [{dialect: ANSI_SQL, expression: CITY}]}}
+      - {name: TYPE, expression: {dialects: [{dialect: ANSI_SQL, expression: TYPE}]}}
+
+relationships:
+  - {name: stock_risk_to_store, from: stock_risk, to: store, from_columns: [STORE_ID], to_columns: [MASTER_STORE_ID]}
+  - {name: inventory_plan_to_store, from: inventory_plan, to: store, from_columns: [STORE_ID], to_columns: [MASTER_STORE_ID]}
+  - {name: forecast_to_store, from: forecast, to: store, from_columns: [MASTER_STORE_ID], to_columns: [MASTER_STORE_ID]}
+
+metrics:
+  - name: near_expiry_units
+    description: Sellable units in batches expiring within 3 days
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "SUM(stock_risk.expiring_qty)"}]}
+  - name: expiry_value_at_risk_inr
+    description: Near-expiry units priced at unit COGS (INR)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "ROUND(SUM(stock_risk.expiring_qty * stock_risk.unit_cogs_inr), 0)"}]}
+  - name: low_stock_pair_share_pct
+    description: Share of (store, SKU) pairs at or below safety stock (%)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "ROUND(SUM(CASE WHEN stock_risk.risk_type IN ('low_stock', 'critical_low', 'both') THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(stock_risk.STORE_ID), 0), 1)"}]}
+  - name: critical_low_pairs
+    description: (store, SKU) pairs at or below the hard low-stock floor
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "SUM(CASE WHEN stock_risk.risk_type = 'critical_low' THEN 1 ELSE 0 END)"}]}
+  - name: forecast_coverage_days
+    description: Days from today to the last date the latest forecast run covers
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "DATE_DIFF(MAX(CASE WHEN forecast.IS_LATEST_FORECAST THEN forecast.FORECAST_DATE END), CURRENT_DATE(), DAY)"}]}
+
+verified_queries:
+  # shelf_life_risk_monitoring `at_risk_products`.
+  - name: at_risk_store_skus
+    question: Which (store, SKU) pairs are near expiry or low on stock right now?
+    sql: |
+      SELECT STORE_ID AS store_id, SKU_ID AS product_sku, risk_type, total_available,
+             days_to_expiry, soonest_expiry, batches
+      FROM `gen-lang-client-0520145261.bronze.V_STORE_STOCK_RISK`
+      WHERE risk_type <> 'ok'
+      ORDER BY days_to_expiry, store_id, product_sku
+  # inventory_optimization `inventory_plan` — only rows its action bucket won't `hold`.
+  - name: inventory_plan_rows
+    question: Which (store, SKU) pairs have expiring stock or demand above stock on hand?
+    sql: |
+      SELECT STORE_ID AS store_id, SKU_ID AS product_sku, available_quantity, expiring_qty,
+             soonest_expiry, days_to_expiry, forecast_3d, nearest_store_id, distance_km
+      FROM `gen-lang-client-0520145261.bronze.V_INVENTORY_PLAN_INPUTS`
+      WHERE IFNULL(expiring_qty, 0) > 0 OR IFNULL(available_quantity, 0) < IFNULL(forecast_3d, 0)
+      ORDER BY store_id, product_sku

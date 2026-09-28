@@ -141,6 +141,9 @@ processes:
                   records: "{{rows_held}}"
               footer_note: "Generated automatically by the Inventory Optimization process."
 
+    # Display-only; the goal bindings in goals.yaml deliver the values into a run.
+    related_kpis: [near_expiry_units, low_stock_pair_share_pct]
+
     metadata:
       version: 2
       effective_from: 2026-07-23
@@ -151,75 +154,23 @@ processes:
       tools:
         skills: []
 
-      # inventory_plan assembly: forecast + inventory joined per (store, SKU), nearest
-      # transferable store via transfer_route, then an action bucket, plus a ceiled
-      # `forecast_units` for display.
+      # inventory_plan: one named query on the inventory semantic model returns every
+      # (store, SKU) with expiring stock or demand above stock — stock, 3-day forecast
+      # and nearest transfer store joined in V_INVENTORY_PLAN_INPUTS. `post` only
+      # applies this process's action rules and a ceiled `forecast_units` for display.
       context_package:
         - key: inventory_plan
           required: true
-          gather:
-            collect:
-              - as: forecast
-                entity: Store
-                dataset: gold.FORECAST_RESULTS_UPDATE
-                columns: [SKU_ID, MASTER_STORE_ID, FORECAST_DATE, PREDICTED_SALES_QUANTITY, DAYS_AHEAD, IS_LATEST_FORECAST]
-                limit: 5000
-                reduce:
-                  rename: { SKU_ID: product_sku, MASTER_STORE_ID: store_id }
-                  rollup:
-                    group_by: [store_id, product_sku]
-                    filter_rows:
-                      compute:
-                        - { as: _days_out, days_until: FORECAST_DATE }
-                      where:
-                        - { field: IS_LATEST_FORECAST, op: eq, value: true }
-                        - { field: _days_out, op: gte, value: 1 }
-                        - { field: _days_out, op: lte, value: 3 }
-                    agg:
-                      - { as: forecast_3d, op: sum, col: PREDICTED_SALES_QUANTITY }
-
-              - as: inventory
-                entity: Store
-                dataset: STORE_INVENTORY_DAILY
-                columns: [store_id, product_sku, available_quantity, expiry_date, snapshot_date, batch_row_number]
-                order_by: snapshot_date
-                order_dir: desc
-                limit: 2000
-                reduce:
-                  latest_snapshot: { by: [store_id], "on": snapshot_date }
-                  rollup:
-                    group_by: [store_id, product_sku]
-                    filter_rows:
-                      compute:
-                        - { as: _dte, days_until: expiry_date }
-                        - as: _expiring_unit
-                          bucket:
-                            - { when: { field: _dte, op: lte, value: 3 }, value: { col: available_quantity } }
-                            - { else: 0 }
-                      where: [{ field: _dte, op: gte, value: 0 }]
-                    agg:
-                      - { as: available_quantity, op: sum, col: available_quantity }
-                      - { as: expiring_qty,       op: sum, col: _expiring_unit }
-                      - { as: soonest_expiry,     op: min, col: expiry_date }
-
-            join:
-              - { left: forecast, right: inventory, "on": [store_id, product_sku], how: outer }
-
-            links:
-              - from: store_id
-                from_type: Store
-                via: transfer_route
-                direction: out
-                pick: { by: distance_km, order: min }
-                bring: [distance_km]
-                bring_id: nearest_store_id
-
+          source: semantic_model
+          query:
+            model_name: inventory_freshness_semantic_model
+            name: inventory_plan_rows
           post:
             fillna: { available_quantity: 0, forecast_3d: 0, expiring_qty: 0 }
             compute:
-              - { as: days_to_expiry, days_until: soonest_expiry }
+              # days_to_expiry comes from the view.
               # Display forecast: ceil to a whole number, then floor at 1 (never 0)
-              # via a bucket — the gather has no floor/max op, so map <1 -> 1.
+              # via a bucket — post has no floor/max op, so map <1 -> 1.
               - { as: _fc_ceil, ceil: forecast_3d }
               - as: forecast_units
                 bucket:

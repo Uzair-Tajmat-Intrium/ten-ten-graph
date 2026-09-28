@@ -1,33 +1,12 @@
-# Dataset links for the fast-moving data that used to be materialised on apply
-# (see integrations/live_bq.yaml). Each binds an entity TYPE to a BigQuery
-# source table. `connection: live_bq` resolves to the live_bq integration's
-# connection block.
+# Dataset links for the fast-moving data behind the entity-page widgets below. Each
+# binds an entity TYPE to a BigQuery table; `connection:` names the integration.
+# `id_column` rows ARE instances of the type; `match` only scopes to existing ones.
 #
-# TWO KINDS, and the difference matters — it decides whether a link CREATES
-# entities:
-#
-#   id_column:  this table's rows ARE instances of the entity type. The column
-#               becomes each row's id. Store.id == MASTER_STORE_ID,
-#               Product.id == SKU (pim_bq maps Product id: SKU).
-#   match:      this table is only SCOPED to an already-existing instance —
-#               a list of {entity_property, table_column}. Creates nothing.
-#
-# A single-entry legacy `join_keys:` is silently upgraded to `id_column`
-# (config.upgrade_legacy_join_keys), which is how eight Product links that are
-# NOT SKU-grained — categories, product lines, ideas, and three union/aggregate
-# scan tables — ended up minting Product entities on the first-apply bulk sync.
-# That is where "Desserts", "FAMILIES" and "END_OF_CANDIDATES" came from in the
-# Product list. They are `match:` now (2026-09-23) so they create nothing.
-#
-# Those eight are read cross-type via dataset_search, which resolves a link by
-# (entity_type, source_table) and never looks at id_column/match — so scoping
-# is irrelevant to how they are actually used. Where a real scope exists it is
-# declared honestly (category / product_line, which are now Product properties);
-# where none does, the match names a column that will never equal a SKU, which
-# is the schema's only way to say "never creates entities".
+# Processes do NOT read these — every process read goes through an OSI semantic
+# model (semantic_models/*.osi.yaml). Only widget-backing links are kept here.
 
 datasets:
-  # --- attached to Store -------------------------------------------------
+  # --- attached to Store ---------------------------------------------------
   - entity_type: Store
     name: Reviews
     description: Customer review events for this store (lazy).
@@ -37,23 +16,6 @@ datasets:
     join_keys:
       - { entity_attribute: id, table_column: MASTER_STORE_ID }
     columns: [REVIEW_ID, REVIEW_TEXT, STAR_RATING, REVIEW_DATE, SOURCE_SYSTEM, CUSTOMER_NAME, MASTER_STORE_ID]
-
-  - entity_type: Store
-    name: Review complaint candidates
-    description: Low-rated reviews from the last 30 days, narrowed for the
-      formulation_feedback_loop agent step. One-letter columns and a 140-char text cap keep
-      the rowset inside that step's 9000-char prompt budget. S = store id, D = review date,
-      N = integer day index (the 14-day test is done on N, not on D), T = review text,
-      P = the SKU whose catalog family name appears in T, or ''. The clustering step reads
-      [S, D, N, T] and deliberately NOT P -- `columns` is chosen per read, so P costs it
-      nothing -- while the `reviewed_products` context key reads [P] alone to mint Product
-      cards. See sql/views.sql.
-    source_table: V_REVIEW_COMPLAINT_CANDIDATES
-    connection: live_bq
-    cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: S }
-    columns: [S, D, N, T, P]
 
   - entity_type: Store
     name: Complaints
@@ -90,53 +52,14 @@ datasets:
   - entity_type: Store
     name: Sales
     description: Order-line sales for this store from the silver BASE table (no view) — queried via raw SQL fully-qualifying silver.BUSINESS_ANALYTICS. Anchor for the per-SKU sales widget.
-    source_table: silver.BUSINESS_ANALYTICS   # dataset-qualified so the gather's dataset-read path hits silver, not the connection's default bronze
+    source_table: silver.BUSINESS_ANALYTICS   # dataset-qualified so the read hits silver, not the connection's default bronze
     connection: live_bq
     cardinality: "1:m"
     join_keys:
       - { entity_attribute: id, table_column: STORE_ID }
     columns: [STORE_ID, SKU_ID, ITEM_SOURCE_NAME, QUANTITY, TOTAL, NET, ORDER_DATE, ORDER_STATE, ONLINE_ORDER_ID]
 
-  - entity_type: Store
-    name: Campaign history
-    description: Zomato/Swiggy ad campaign performance for this store across ALL history, rolled up to one row per (campaign, calendar month) — no CURRENT_DATE() scoping, unlike "Current campaigns" above (lazy). Read by seasonal_campaign_planning.yaml's seasonal_campaign_history context key to evaluate past comparable-window performance for an upcoming event.
-    source_table: V_STORE_CAMPAIGN_HISTORY
-    connection: live_bq
-    cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: MASTER_STORE_ID }
-    columns: [MASTER_STORE_ID, CAMPAIGN_ID, MONTH, RES_ID, PLATFORM, PRODUCT_TYPE, TARGETING, SEGMENTS, WINDOW_START, WINDOW_END, AD_SPEND_RS, AD_SALES_RS, AD_ORDERS, AD_IMPRESSIONS, AD_CLICKS, ROI, ADS_M2O_PCT, OVERALL_M2O_PCT, ROAS, CTR]
-
-  # Same V_SEGMENT_BUDGET table as the CustomerSegment link below, joined by
-  # STORE instead — lets a Store-anchored gather (e.g. campaign_planning_
-  # optimisation.yaml's segment_budget context key) resolve it directly,
-  # symmetric with "Current campaigns" above.
-  - entity_type: Store
-    name: Budget allocations
-    description: This store's marketing budget allocated per segment, by channel/month (lazy).
-    source_table: V_SEGMENT_BUDGET
-    connection: live_bq
-    cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: MASTER_STORE_ID }
-    columns: [SEGMENT_ID, MASTER_STORE_ID, STORE_NAME, CHANNEL, BUDGET_MONTH, ALLOCATED_BUDGET_RS, EXPECTED_REVENUE_RS]
-
-  # --- attached to Product ----------------------------------------------
-  # Static product truth (1:1 on SKU) from the PIM dataset, not bronze — hence
-  # `connection: pim_bq`, whose default dataset is ctx_upside_master_data.
-  # IMAGES_LINK is the Drive folder holding the SKU's label artwork; the
-  # label_compliance_review process reads it from here and lists that folder
-  # directly, instead of searching Drive by product name.
-  - entity_type: Product
-    name: Product label facts
-    description: On-pack declarations + label artwork Drive folder link (IMAGES_LINK) for this SKU (lazy, 1:1).
-    source_table: DIM_PRODUCT
-    connection: pim_bq
-    cardinality: "1:1"
-    join_keys:
-      - { entity_attribute: id, table_column: SKU }
-    columns: [SKU, DISPLAY_NAME, VEG_NONVEG, SIZE_LABEL, SIZE_GM, VERSION, STATUS, DESCRIPTION, IMAGES_LINK]
-
+  # --- attached to Product -------------------------------------------------
   - entity_type: Product
     name: Inventory batches
     description: Latest inventory snapshot for this product across stores (lazy).
@@ -159,24 +82,12 @@ datasets:
 
   - entity_type: Product
     name: Forecast
-    description: Latest-run demand forecast (next 1-3 days) per store for this product, from the gold BASE table. source_table is dataset-qualified (gold.) so the dataset-read path (widgets + the inventory_optimization gather) resolves it in gold, not the connection's default bronze dataset.
+    description: Latest-run demand forecast (next 1-3 days) per store for this product, from the gold BASE table. source_table is dataset-qualified (gold.) so the widget read path resolves it in gold, not the connection's default bronze dataset.
     source_table: gold.FORECAST_RESULTS_UPDATE
     connection: live_bq
     cardinality: "1:m"
     join_keys:
       - { entity_attribute: id, table_column: SKU_ID }
-    columns: [SKU_ID, MASTER_STORE_ID, FORECAST_DATE, PREDICTED_SALES_QUANTITY, DAYS_AHEAD, IS_LATEST_FORECAST]
-
-  # Same gold forecast table, joined by STORE — lets the inventory_optimization
-  # gather START from the Store node (per-store forecast read), symmetric with inventory.
-  - entity_type: Store
-    name: Forecast by store
-    description: Latest-run demand forecast per SKU for this store, from gold. Store-anchored (join on MASTER_STORE_ID) so a gather can traverse Store -> forecast.
-    source_table: gold.FORECAST_RESULTS_UPDATE
-    connection: live_bq
-    cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: MASTER_STORE_ID }
     columns: [SKU_ID, MASTER_STORE_ID, FORECAST_DATE, PREDICTED_SALES_QUANTITY, DAYS_AHEAD, IS_LATEST_FORECAST]
 
   - entity_type: Product
@@ -189,119 +100,6 @@ datasets:
       - { entity_attribute: id, table_column: SKU_ID }
     columns: [SKU_ID, STORE_ID, QUANTITY, TOTAL, NET, ORDER_DATE, ORDER_STATE]
 
-  # Master cost/price facts (static PIM truth) exposed as a 1:1 self-link so a
-  # gather can read cost/MRP/shelf-life by SKU (they're Product NODE properties,
-  # not otherwise reachable via search_dataset). connection: pim_bq resolves to
-  # the pim_bq integration (dataset ctx_upside_master_data), NOT live_bq/bronze.
-  # Used by the shelf_life_rescue_desk process to compute ₹ value-at-risk.
-  - entity_type: Product
-    name: Product cost & price
-    description: Static master cost/price/shelf-life for this product from V_PRODUCT_ENRICHED (lazy, 1:1 on SKU).
-    source_table: V_PRODUCT_ENRICHED
-    connection: pim_bq
-    cardinality: "1:1"
-    join_keys:
-      - { entity_attribute: id, table_column: SKU }
-    columns: [SKU, DISPLAY_NAME, MRP_INR, TOTAL_COGS_INR, SHELF_LIFE_DAYS]
-
-  # --- attached to CustomerSegment --------------------------------------
-  - entity_type: CustomerSegment
-    name: Budget allocations
-    description: Per-store marketing budget allocated to this segment, by channel/month (lazy).
-    source_table: V_SEGMENT_BUDGET
-    connection: live_bq
-    cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: SEGMENT_ID }
-    columns: [SEGMENT_ID, MASTER_STORE_ID, STORE_NAME, CHANNEL, BUDGET_MONTH, ALLOCATED_BUDGET_RS, EXPECTED_REVENUE_RS]
-
-  - entity_type: Product
-    name: All Ideas
-    description: Ideas table for innovation triage
-    source_table: DIM_IDEA
-    connection: pim_bq
-    cardinality: "1:m"
-    match:
-      - { entity_property: id, table_column: IDEA_ID }
-    columns: [IDEA_ID, NAME, STAGE, HYPOTHESIS, THESIS_FIT, TARGET_COGS_INR, STAGE_ENTERED_AT]
-
-  # Read as the `active_briefs` context key, and browsable per idea here.
-  - entity_type: Product
-    name: Brief scoring inputs
-    description: Per-idea priority-scoring inputs for the active pipeline (V_IDEA_PRIORITY_INPUTS)
-      — DAYS_IN_STAGE, STAGE_RANK, TARGET_COGS_INR vs the portfolio COGS envelope, and the
-      COGS_FIT band. Active briefs only (STAGE not Rejected/Launch).
-    source_table: V_IDEA_PRIORITY_INPUTS
-    connection: pim_bq
-    cardinality: "1:m"
-    match:
-      - { entity_property: id, table_column: IDEA_ID }
-    columns: [IDEA_ID, NAME, STAGE, HYPOTHESIS, THESIS_FIT, TARGET_COGS_INR, DAYS_IN_STAGE, STAGE_RANK, PORTFOLIO_MIN_COGS_INR, PORTFOLIO_MAX_COGS_INR, COGS_FIT]
-
-  - entity_type: Product
-    name: Portfolio products
-    description: Enriched product catalog
-    source_table: V_PRODUCT_ENRICHED
-    connection: pim_bq
-    cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: SKU }
-    columns: [SKU, DISPLAY_NAME, DESCRIPTION, STATUS, IS_ACTIVE, CATEGORY]
-
-  - entity_type: Competitor
-    name: Active competitors
-    description: Competitors table
-    source_table: DIM_COMPETITOR
-    connection: pim_bq
-    cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: COMPETITOR_ID }
-    columns: [COMPETITOR_ID, COMPETITOR_NAME, CATEGORY, IS_ACTIVE]
-
-  - entity_type: CompetitorProduct
-    name: Active competitor products
-    description: Competitor products table
-    source_table: DIM_COMPETITOR_PRODUCT
-    connection: pim_bq
-    cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: COMPETITOR_PRODUCT_ID }
-    columns: [COMPETITOR_PRODUCT_ID, PRODUCT_NAME, CITY, IS_ACTIVE, COMPETITOR_ID]
-
-  - entity_type: Ingredient
-    name: Ingredient master
-    description: Every ingredient the company sources (DIM_INGREDIENT). Each one is already used in at least one live SKU, so presence here means "we already buy this". Carries no stock quantities. Read by idea_capture_triage's ingredient-availability step.
-    source_table: DIM_INGREDIENT
-    connection: pim_bq
-    cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: INGREDIENT_ID }
-    columns: [INGREDIENT_ID, INGREDIENT_NAME, CATEGORY]
-
-  # Re-homed from entity_type: ProductLine when that type was demoted to a
-  # ProductCategory hierarchy level (2026-09-23). This read is NOT SKU-grained —
-  # it is product-line-grained and reached cross-type via dataset_search, so
-  # Product is a carrier type here (same pattern as "Category market signal" and
-  # "Triage similarity candidates" below), not a join to one SKU.
-  #
-  # LOAD-BEARING: idea_capture_triage's Assess Feasibility step reads this as a
-  # `required: true` fact. If this link 404s, that fact goes missing and every
-  # idea silently grades NOT_APPLICABLE — no error, just wrong verdicts.
-  - entity_type: Product
-    name: Production capability
-    description: Product lines actually manufactured today, with active SKU count, COGS range and shelf life. Read by idea_capture_triage's feasibility step.
-    source_table: V_PRODUCT_LINE_CAPABILITY
-    connection: pim_bq
-    cardinality: "1:m"
-    match:
-      - { entity_property: product_line, table_column: PRODUCT_LINE_NAME }
-    columns: [PRODUCT_LINE_ID, PRODUCT_LINE_NAME, CATEGORY_NAME, ACTIVE_SKUS, MIN_COGS_INR, MAX_COGS_INR, AVG_SHELF_LIFE_DAYS]
-
-  # --- listing package (processes/new_listing_creation.yaml) --------------
-  # Four PIM-side reads for building a channel listing. The 1:1 package is the one
-  # the agent reasons over — every long field on it is pre-aggregated to a scalar in
-  # SQL (see sql/views.sql) so a single row carries the whole listing un-previewed;
-  # the three 1:m links below are what the reviewer's tables render from.
   - entity_type: Product
     name: Listing package
     description: Complete listing package for this SKU plus its deterministic FSSAI/marketplace readiness (lazy, 1:1 on SKU).
@@ -331,119 +129,16 @@ datasets:
     columns: [CLAIM_ID, SKU, HIGHLIGHT_SEQ, CLAIM_TEXT, CLAIM_KIND, NUTRIENT, ASSERTED_VALUE, CLAIM_BASIS,
               PANEL_BASIS, LAB_UNIT, LAB_PER_100G, LAB_PER_SERVING, LAB_VALUE_COMPARED, DEVIATION_PCT, VERDICT]
 
-  - entity_type: Product
-    name: Nutrition panel
-    description: Canonicalised nutrition panel for this SKU in FSSAI print order, with declaration basis (lazy, 1:m).
-    source_table: V_PRODUCT_NUTRIENT_CLEAN
-    connection: pim_bq
+  # --- attached to CustomerSegment -----------------------------------------
+  - entity_type: CustomerSegment
+    name: Budget allocations
+    description: Per-store marketing budget allocated to this segment, by channel/month (lazy).
+    source_table: V_SEGMENT_BUDGET
+    connection: live_bq
     cardinality: "1:m"
     join_keys:
-      - { entity_attribute: id, table_column: SKU }
-    columns: [SKU, NUTRIENT, RAW_NAME, VALUE, UNIT, DV_PCT, NUTRIENT_BASIS, PANEL_SERVING_GM,
-              IS_FSSAI_MANDATORY, VALUE_MISSING, PANEL_ORDER]
-
-  - entity_type: Product
-    name: Channel terms
-    description: Per-channel commercial terms of record for this SKU, channel named (lazy, 1:m).
-    source_table: V_LISTING_CHANNEL_PRICING
-    connection: pim_bq
-    cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: SKU }
-    columns: [SKU, CHANNEL_ID, CHANNEL_NAME, CHANNEL_TYPE, APPLICABLE, CHANNEL_MRP_INR, CHANNEL_GST_RATE,
-              CHANNEL_BASE_PRICE_INR, CHANNEL_COGS_INR, CHANNEL_SHELF_LIFE_DAYS, PRIMARY_SALES_OWNER]
-
-  - entity_type: Product
-    name: Product family names
-    description: >-
-      ONE ROW whose NM is every active product family, pipe-separated -- the closed vocabulary
-      formulation_feedback_loop's clustering step must pick from when it infers a product from
-      free review text. Aggregated into a single row on purpose: a context_package fact that is
-      a list of more than 4 rows is previewed down to 4 before the step sees it, so 24 family
-      rows would arrive as 4. Not entity-scoped -- never rendered as a Product widget.
-      CG pairs the same families with their entry-pack COGS, so an approved reformulation brief
-      can carry TARGET_COGS_INR. Families with no costed active SKU are absent from CG.
-    source_table: V_PRODUCT_FAMILY_NAMES
-    connection: pim_bq
-    cardinality: "1:m"
-    match:
-      - { entity_property: id, table_column: ID }
-    columns: [ID, NM, CG]
-
-  - entity_type: Product
-    name: Triage similarity candidates
-    description: >-
-      Pipeline ideas + live SKUs + per-category counts + competitor examples + an end-of-list
-      sentinel, unioned into one candidate set behind a numerically-prefixed SRC discriminator.
-      Read cross-type via dataset_search by idea_capture_triage's TWO matching steps, each
-      filtering SRC to its own arms so each gets its own 9000-char step-input budget. FOUR
-      PACKED COLUMNS: a column name is a JSON key on every row, and the previous ten-column
-      shape measured 16904 chars against a 9000 cap. Per-grain fields are packed positionally
-      into D — see sql/views.sql for the layout. Every column a step references, in `columns`
-      or in `filters`, must be declared below or the read 400s. Not entity-scoped — never
-      rendered as a Product widget.
-    source_table: V_TRIAGE_SIMILARITY_CANDIDATES
-    connection: pim_bq
-    cardinality: "1:m"
-    match:
-      - { entity_property: id, table_column: ID }
-    columns: [SRC, ID, NM, D]
-
-  - entity_type: Product
-    name: Pipeline priority candidates
-    description: Active briefs + per-category demand/compliance/channel reference + the cost
-      envelope + the ingredient master, unioned into one narrow rowset behind a SRC
-      discriminator, read cross-type via dataset_search by innovation_pipeline_prioritisation's
-      scoring step so all ~38 briefs arrive un-truncated through a single fetch. Four columns
-      only, and the reference grains are packed into DATA, because STEP INPUT DATA is capped at
-      9000 chars (see the view's header comment in sql/views.sql). Not entity-scoped — never
-      rendered as a Product widget.
-    source_table: V_PIPELINE_PRIORITY_CANDIDATES
-    connection: pim_bq
-    cardinality: "1:m"
-    match:
-      - { entity_property: id, table_column: ID }
-    columns: [SRC, ID, NAME, DATA]
-
-  - entity_type: Product
-    name: Category market signal
-    description: Realised demand per product category (V_CATEGORY_MARKET_SIGNAL) — units and
-      revenue over the trailing 90 days vs the prior 90, growth %, forward forecast, active SKUs,
-      plus competitor counts as a tiebreaker. The evidence behind the market-signal factor in
-      innovation_pipeline_prioritisation. Category-grained, not entity-scoped.
-    source_table: V_CATEGORY_MARKET_SIGNAL
-    connection: pim_bq
-    cardinality: "1:m"
-    match:
-      - { entity_property: category, table_column: CATEGORY_NAME }
-    columns: [CATEGORY_NAME, UNITS_90D, NET_REVENUE_90D, UNITS_PRIOR_90D, GROWTH_PCT, FORECAST_UNITS_NEXT, ACTIVE_SKUS_IN_CATEGORY, ACTIVE_COMPETITOR_PRODUCTS, DISTINCT_COMPETITORS]
-
-  # --- category master (carrier type: Product) -----------------------------
-  # Re-homed from entity_type: Category when that type was demoted to a
-  # ProductCategory hierarchy level (2026-09-23). Category-grained, not
-  # SKU-grained — Product is the carrier type, as for the reads above.
-  #
-  # REQUIRED for innovation_pipeline_prioritisation's `active_categories` context key.
-  # dataset_search resolves (entity_type, dataset) through THIS catalog, not through the
-  # process YAML: without this row the read fails with
-  #   POST /datasets/search -> 404: No dataset linking 'DIM_CATEGORY' to 'Product'.
-  # The key is `required: false`, so that 404 does not fail the run — it fails SILENTLY.
-  # Its real job is to put rows on the entity snapshot: a full sweep resolves no entity
-  # from the event, so with this link missing the run ends with `entities=0`,
-  # save_entity_snapshot writes `entities: []`, and the UI hides the whole Full Context
-  # tab (page.tsx TABS.filter). The process's `post.resolve` now mints Product cards
-  # from SKU, so nothing here depends on a Category node existing.
-  - entity_type: Product
-    name: Category master
-    description: Every product category in the taxonomy (DIM_CATEGORY) — Desserts, Health
-      Bars, Snacks, Mithai, Savories, Dessert bites. Read as the `active_categories`
-      context key so a sweep's entity snapshot carries the categories it scored against.
-    source_table: DIM_CATEGORY
-    connection: pim_bq
-    cardinality: "1:m"
-    match:
-      - { entity_property: category, table_column: CATEGORY_NAME }
-    columns: [CATEGORY_ID, CATEGORY_NAME]
+      - { entity_attribute: id, table_column: SEGMENT_ID }
+    columns: [SEGMENT_ID, MASTER_STORE_ID, STORE_NAME, CHANNEL, BUDGET_MONTH, ALLOCATED_BUDGET_RS, EXPECTED_REVENUE_RS]
 
 widgets:
   # --- Store page --------------------------------------------------------
@@ -481,7 +176,6 @@ widgets:
         SELECT * FROM `bronze.STORE_INVENTORY_DAILY`
         WHERE store_id = {{entity_id}}
         QUALIFY snapshot_date = MAX(snapshot_date) OVER ()
-
 
   - entity_type: Store
     type: table
