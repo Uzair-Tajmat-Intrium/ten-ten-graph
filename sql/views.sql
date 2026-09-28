@@ -33,8 +33,18 @@ SELECT
   pk.PACKAGING_TYPE,
   pk.GS1_BARCODE,
   pk.ORG_LABELLING_COMPLIANCE,
-  nu.SERVING_SIZE
+  nu.SERVING_SIZE,
+  -- Taxonomy denormalised onto the SKU row (2026-09-23). Category and
+  -- ProductLine stopped being entity types and became levels of the
+  -- ProductCategory hierarchy, which attaches to Product.category /
+  -- Product.product_line — so the NAMES have to arrive as Product properties.
+  -- Without these two columns the hierarchy shows "0 matched", because nothing
+  -- populates the properties it is attached to.
+  c.CATEGORY_NAME,
+  l.PRODUCT_LINE_NAME
 FROM `gen-lang-client-0520145261.ctx_upside_master_data.DIM_PRODUCT` p
+LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_CATEGORY`     c ON c.CATEGORY_ID = p.CATEGORY_ID
+LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_PRODUCT_LINE` l ON l.PRODUCT_LINE_ID = p.PRODUCT_LINE_ID
 LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.PRODUCT_PRICING`   pr USING (SKU)
 LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.PRODUCT_PACKAGING` pk USING (SKU)
 LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.PRODUCT_NUTRITION` nu USING (SKU);
@@ -803,3 +813,456 @@ FROM (
   WHERE IS_ACTIVE
   GROUP BY fam
 );
+
+-- =====================================================================
+-- LISTING PACKAGE (gen-lang-client-0520145261.ctx_upside_master_data)
+-- Feeds processes/new_listing_creation.yaml. The listing content itself is a
+-- straight assembly job; what these views add is ACCURACY -- they normalise the
+-- OCR'd nutrition panel, re-express it on both legal bases, check every on-pack
+-- claim against the lab figure, and derive the allergens the recipe implies so an
+-- under-declaration is caught before a marketplace ever sees it.
+-- Order matters: NUTRIENT_CLEAN -> CLAIM_CHECK -> LISTING_PACKAGE.
+-- =====================================================================
+
+-- Canonical nutrition panel. PRODUCT_NUTRIENT is vision-OCR output, so the same
+-- nutrient arrives as 'Total fat'/'total fat', 'Dietary fiber'/'Diatery fiber'/
+-- 'Diaterary fiber', energy in 'Kcal'/'kcal'/'kcl', grams as 'g'/'gm' -- and the
+-- panel's own header rows ('Amount per 100 gm', 'serving Size') leaked in as if they
+-- were nutrients. This collapses the variants to one vocabulary, drops the headers,
+-- and recovers from them the DECLARATION BASIS, without which no nutrition figure
+-- can be published (14.71 g protein per 100 g and per 70 g serving are different
+-- listings). Marks which nutrients FSSAI mandates and the legal print order.
+CREATE OR REPLACE VIEW `gen-lang-client-0520145261.ctx_upside_master_data.V_PRODUCT_NUTRIENT_CLEAN` AS
+WITH raw AS (
+  SELECT
+    SKU,
+    NUTRIENT_NAME AS RAW_NAME,
+    LOWER(TRIM(NUTRIENT_NAME)) AS n,
+    VALUE, UNIT, DV_PCT
+  FROM `gen-lang-client-0520145261.ctx_upside_master_data.PRODUCT_NUTRIENT`
+),
+-- Per-SKU declaration basis, recovered from the OCR header rows that leaked into
+-- the table as if they were nutrients ("Amount per 100 gm" / "Amount per serving").
+basis AS (
+  SELECT
+    SKU,
+    CASE
+      WHEN LOGICAL_OR(n LIKE 'amount per 100%') THEN 'per_100g'
+      WHEN LOGICAL_OR(n LIKE 'amount per serv%') THEN 'per_serving'
+      -- No basis header survived OCR, but the panel's own serving row says 100 g —
+      -- the values are on the per-100 g basis by construction. Labelled `_inferred`
+      -- so the listing gate can treat it as a warning, not as verified truth.
+      WHEN MAX(IF(n LIKE 'serving size', VALUE, NULL)) = 100 THEN 'per_100g_inferred'
+      ELSE 'unknown'
+    END AS NUTRIENT_BASIS,
+    MAX(IF(n LIKE 'serving size', VALUE, NULL)) AS PANEL_SERVING_GM
+  FROM raw GROUP BY SKU
+),
+canon AS (
+  SELECT
+    r.SKU, r.RAW_NAME, r.VALUE, r.DV_PCT,
+    CASE
+      WHEN r.n LIKE '%amount per%' OR r.n LIKE 'serving size' THEN NULL   -- OCR header, not a nutrient
+      WHEN r.n LIKE '%calorie%' OR r.n LIKE '%energy%'         THEN 'Energy'
+      WHEN r.n LIKE '%protein%'                                THEN 'Protein'
+      WHEN r.n LIKE '%saturated%fat%'                          THEN 'Saturated Fat'
+      WHEN r.n LIKE '%trans%fat%'                              THEN 'Trans Fat'
+      WHEN r.n LIKE '%fat%'                                    THEN 'Total Fat'
+      WHEN r.n LIKE '%added%sugar%'                            THEN 'Added Sugars'
+      WHEN r.n LIKE '%net%carb%'                               THEN 'Net Carbohydrate'
+      WHEN r.n LIKE '%carb%'                                   THEN 'Total Carbohydrate'
+      WHEN r.n LIKE '%sugar%'                                  THEN 'Total Sugars'
+      WHEN r.n LIKE '%fib%'                                    THEN 'Dietary Fibre'
+      WHEN r.n LIKE '%sodium%'                                 THEN 'Sodium'
+      WHEN r.n LIKE '%cholesterol%'                            THEN 'Cholesterol'
+      ELSE NULL
+    END AS NUTRIENT,
+    CASE
+      WHEN r.n LIKE '%calorie%' OR r.n LIKE '%energy%' THEN 'kcal'
+      WHEN LOWER(IFNULL(r.UNIT, '')) IN ('g', 'gm', 'gms', 'gram') THEN 'g'
+      WHEN LOWER(IFNULL(r.UNIT, '')) = 'mg' THEN 'mg'
+      ELSE NULLIF(LOWER(TRIM(IFNULL(r.UNIT, ''))), '')
+    END AS UNIT
+  FROM raw r
+)
+SELECT
+  c.SKU,
+  c.NUTRIENT,
+  c.RAW_NAME,
+  c.VALUE,
+  c.UNIT,
+  c.DV_PCT,
+  b.NUTRIENT_BASIS,
+  b.PANEL_SERVING_GM,
+  c.NUTRIENT IN ('Energy','Protein','Total Carbohydrate','Total Sugars','Added Sugars',
+                 'Total Fat','Saturated Fat','Trans Fat','Sodium') AS IS_FSSAI_MANDATORY,
+  c.VALUE IS NULL AS VALUE_MISSING,
+  -- FSSAI panel print order, so the listing renders the panel the legal way.
+  CASE c.NUTRIENT
+    WHEN 'Energy' THEN 1 WHEN 'Total Fat' THEN 2 WHEN 'Saturated Fat' THEN 3
+    WHEN 'Trans Fat' THEN 4 WHEN 'Cholesterol' THEN 5 WHEN 'Total Carbohydrate' THEN 6
+    WHEN 'Total Sugars' THEN 7 WHEN 'Added Sugars' THEN 8 WHEN 'Dietary Fibre' THEN 9
+    WHEN 'Protein' THEN 10 WHEN 'Sodium' THEN 11 ELSE 99
+  END AS PANEL_ORDER
+FROM canon c
+JOIN basis b USING (SKU)
+WHERE c.NUTRIENT IS NOT NULL;
+
+-- One row per on-pack claim, checked against the lab panel. PRODUCT_HIGHLIGHT is
+-- free marketing text copied across pack sizes and flavours ('17g Protein' sits on
+-- all six cheesecake SKUs, whose measured protein ranges 11.42-14.71 g), so each
+-- claim is parsed into {nutrient, asserted value, basis}, compared against the same
+-- nutrient re-expressed on the basis the claim itself asserts, and given a verdict.
+-- A NULL lab value never reads as zero -- it reads as 'no_lab_value'.
+CREATE OR REPLACE VIEW `gen-lang-client-0520145261.ctx_upside_master_data.V_LISTING_CLAIM_CHECK` AS
+WITH panel AS (
+  SELECT SKU, NUTRIENT, VALUE, UNIT, NUTRIENT_BASIS, PANEL_SERVING_GM
+  FROM `gen-lang-client-0520145261.ctx_upside_master_data.V_PRODUCT_NUTRIENT_CLEAN`
+),
+-- Same value re-expressed on both legal bases, so a claim can be checked against
+-- whichever basis it actually asserts.
+panel_both AS (
+  SELECT
+    SKU, NUTRIENT, UNIT, NUTRIENT_BASIS, PANEL_SERVING_GM,
+    CASE WHEN NUTRIENT_BASIS LIKE 'per_100g%' THEN VALUE
+         WHEN NUTRIENT_BASIS = 'per_serving' AND PANEL_SERVING_GM > 0 THEN ROUND(VALUE * 100 / PANEL_SERVING_GM, 2)
+    END AS LAB_PER_100G,
+    CASE WHEN NUTRIENT_BASIS = 'per_serving' THEN VALUE
+         WHEN NUTRIENT_BASIS LIKE 'per_100g%' AND PANEL_SERVING_GM > 0 THEN ROUND(VALUE * PANEL_SERVING_GM / 100, 2)
+    END AS LAB_PER_SERVING
+  FROM panel
+),
+claims AS (
+  SELECT
+    c.CLAIM_ID, c.SKU, c.HIGHLIGHT_SEQ, c.HIGHLIGHT_TEXT AS CLAIM_TEXT,
+    LOWER(TRIM(c.HIGHLIGHT_TEXT)) AS t
+  FROM `gen-lang-client-0520145261.ctx_upside_master_data.V_PRODUCT_CLAIM` c
+),
+parsed AS (
+  SELECT
+    CLAIM_ID, SKU, HIGHLIGHT_SEQ, CLAIM_TEXT, t,
+    CASE
+      WHEN t LIKE '%saturated%fat%'                 THEN 'Saturated Fat'
+      WHEN t LIKE '%trans%fat%'                     THEN 'Trans Fat'
+      WHEN t LIKE '%protein%'                       THEN 'Protein'
+      WHEN t LIKE '%carb%'                          THEN 'Total Carbohydrate'
+      WHEN t LIKE '%added sugar%'                   THEN 'Added Sugars'
+      WHEN t LIKE '%sugar%'                         THEN 'Total Sugars'
+      WHEN t LIKE '%fib%'                           THEN 'Dietary Fibre'
+      WHEN t LIKE '%sodium%' OR t LIKE '%salt%'     THEN 'Sodium'
+      WHEN t LIKE '%calorie%' OR t LIKE '%energy%'  THEN 'Energy'
+      WHEN t LIKE '%fat%'                           THEN 'Total Fat'
+      ELSE NULL
+    END AS NUTRIENT,
+    -- First number in the text: handles both "17g Protein" and "Saturated fat 1g".
+    -- Skipped for "%" texts ("100% plant based") so a percentage is never read as grams.
+    IF(t LIKE '%\\%%', NULL,
+       SAFE_CAST(REGEXP_EXTRACT(t, r'([0-9]+(?:\.[0-9]+)?)') AS FLOAT64)) AS ASSERTED_VALUE,
+    IF(t LIKE '%per serving%', 'per_serving', 'as_declared') AS CLAIM_BASIS,
+    (t LIKE 'no %' OR t LIKE '%-free%' OR t LIKE '% free' OR t LIKE '%free%'
+     OR t LIKE '%without%' OR t LIKE 'zero %') AS IS_ABSENCE
+  FROM claims
+),
+typed AS (
+  SELECT
+    p.*,
+    CASE
+      -- A number with no nutrient attached ("10.83 gm") is broken PIM data, not a claim.
+      WHEN p.NUTRIENT IS NULL AND p.ASSERTED_VALUE IS NOT NULL  THEN 'malformed'
+      WHEN p.NUTRIENT IS NULL                                   THEN 'non_nutritional'
+      WHEN p.ASSERTED_VALUE IS NOT NULL                         THEN 'quantified'
+      WHEN p.IS_ABSENCE                                         THEN 'absence'
+      ELSE 'comparative'
+    END AS CLAIM_KIND
+  FROM parsed p
+)
+SELECT
+  y.CLAIM_ID, y.SKU, y.HIGHLIGHT_SEQ, y.CLAIM_TEXT, y.CLAIM_KIND,
+  y.NUTRIENT, y.ASSERTED_VALUE, y.CLAIM_BASIS,
+  b.NUTRIENT_BASIS AS PANEL_BASIS, b.UNIT AS LAB_UNIT,
+  b.LAB_PER_100G, b.LAB_PER_SERVING, b.PANEL_SERVING_GM,
+  -- The lab figure the claim should be measured against.
+  IF(y.CLAIM_BASIS = 'per_serving', b.LAB_PER_SERVING, b.LAB_PER_100G) AS LAB_VALUE_COMPARED,
+  CASE
+    WHEN y.ASSERTED_VALUE IS NULL THEN NULL
+    ELSE ROUND(
+      100 * (y.ASSERTED_VALUE - IF(y.CLAIM_BASIS = 'per_serving', b.LAB_PER_SERVING, b.LAB_PER_100G))
+      / NULLIF(IF(y.CLAIM_BASIS = 'per_serving', b.LAB_PER_SERVING, b.LAB_PER_100G), 0), 1)
+  END AS DEVIATION_PCT,
+  CASE
+    WHEN y.CLAIM_KIND = 'malformed'                           THEN 'MALFORMED_CLAIM'
+    WHEN y.CLAIM_KIND = 'non_nutritional'                     THEN 'not_verifiable_from_pim'
+    WHEN y.CLAIM_KIND = 'comparative'                          THEN 'needs_threshold_check'
+    -- No panel row at all, OR a row whose VALUE never made it through OCR. Both mean
+    -- there is nothing to check the claim against — never let a NULL read as zero.
+    WHEN b.NUTRIENT IS NULL
+      OR (b.LAB_PER_100G IS NULL AND b.LAB_PER_SERVING IS NULL) THEN 'no_lab_value'
+    -- A zero / absence assertion ("No Added Sugar", "0g Trans Fat") is basis-independent:
+    -- zero is zero per 100 g and per serving alike, so check it before the basis gate.
+    WHEN IFNULL(y.ASSERTED_VALUE, 0) = 0 THEN
+      IF(IFNULL(b.LAB_PER_100G, IFNULL(b.LAB_PER_SERVING, 0)) = 0, 'substantiated', 'CONTRADICTED')
+    WHEN b.NUTRIENT_BASIS = 'unknown'                         THEN 'basis_unknown'
+    WHEN IF(y.CLAIM_BASIS = 'per_serving', b.LAB_PER_SERVING, b.LAB_PER_100G) IS NULL THEN 'no_lab_value'
+    WHEN ABS(100 * (y.ASSERTED_VALUE - IF(y.CLAIM_BASIS = 'per_serving', b.LAB_PER_SERVING, b.LAB_PER_100G))
+             / NULLIF(IF(y.CLAIM_BASIS = 'per_serving', b.LAB_PER_SERVING, b.LAB_PER_100G), 0)) <= 5 THEN 'substantiated'
+    WHEN ABS(100 * (y.ASSERTED_VALUE - IF(y.CLAIM_BASIS = 'per_serving', b.LAB_PER_SERVING, b.LAB_PER_100G))
+             / NULLIF(IF(y.CLAIM_BASIS = 'per_serving', b.LAB_PER_SERVING, b.LAB_PER_100G), 0)) <= 20 THEN 'review_tolerance'
+    ELSE 'MISMATCH'
+  END AS VERDICT
+FROM typed y
+LEFT JOIN panel_both b ON b.SKU = y.SKU AND b.NUTRIENT = y.NUTRIENT;
+
+-- The complete listing package for one SKU, 1:1, plus its deterministic readiness.
+-- Everything a channel asks for -- name, net quantity, veg mark, MRP, GST, barcode,
+-- FSSAI licence (regex-extracted from the free-text legal block), manufacturer,
+-- storage, ingredient list, allergen declaration, claims, nutrition panel, lab
+-- report, image folder -- and then BLOCKING_GAPS / WARNING_GAPS: what would make a
+-- marketplace or FSSAI reject this listing, computed in SQL so the gate is the same
+-- every run. Long fields are aggregated to scalars on purpose: a 1-row fact reaches
+-- the agent whole, where a row list would be previewed to 4 rows (_compact_facts).
+CREATE OR REPLACE VIEW `gen-lang-client-0520145261.ctx_upside_master_data.V_LISTING_PACKAGE` AS
+WITH ing AS (
+  SELECT m.SKU,
+         STRING_AGG(i.INGREDIENT_NAME, ', ' ORDER BY m.INGREDIENT_ID) AS INGREDIENT_LIST,
+         COUNT(*) AS INGREDIENT_COUNT
+  FROM `gen-lang-client-0520145261.ctx_upside_master_data.MAP_PRODUCT_INGREDIENT` m
+  JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_INGREDIENT` i USING (INGREDIENT_ID)
+  GROUP BY m.SKU
+),
+-- The recipe is recorded on ONE pack size per (product line, flavour) — 22 of 41 live
+-- SKUs have no ingredient rows of their own purely because they are a different size of
+-- a SKU that does. Nominate the nearest such sibling as a donor so the listing can be
+-- assembled; provenance is surfaced as INGREDIENT_SOURCE so inherited data is never
+-- mistaken for verified data.
+donor AS (
+  SELECT SKU, DONOR_SKU FROM (
+    SELECT
+      p.SKU,
+      d.SKU AS DONOR_SKU,
+      ROW_NUMBER() OVER (
+        PARTITION BY p.SKU
+        ORDER BY ABS(IFNULL(d.SIZE_GM, 0) - IFNULL(p.SIZE_GM, 0)), d.SKU
+      ) AS rn
+    FROM `gen-lang-client-0520145261.ctx_upside_master_data.DIM_PRODUCT` p
+    JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_PRODUCT` d
+      ON  d.SKU != p.SKU
+      AND d.PRODUCT_LINE_ID = p.PRODUCT_LINE_ID
+      AND IFNULL(d.FLAVOUR, '') = IFNULL(p.FLAVOUR, '')
+    JOIN ing hi ON hi.SKU = d.SKU
+    LEFT JOIN ing own ON own.SKU = p.SKU
+    WHERE own.SKU IS NULL
+  ) WHERE rn = 1
+),
+alg AS (
+  SELECT m.SKU,
+         STRING_AGG(IF(m.CONTAINS_TYPE = 'contains', a.ALLERGEN_NAME, NULL), ', ' ORDER BY a.ALLERGEN_NAME) AS ALLERGEN_CONTAINS,
+         STRING_AGG(IF(m.CONTAINS_TYPE = 'may_contain', a.ALLERGEN_NAME, NULL), ', ' ORDER BY a.ALLERGEN_NAME) AS ALLERGEN_MAY_CONTAIN,
+         COUNT(*) AS ALLERGEN_ROWS
+  FROM `gen-lang-client-0520145261.ctx_upside_master_data.MAP_PRODUCT_ALLERGEN` m
+  JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_ALLERGEN` a USING (ALLERGEN_ID)
+  GROUP BY m.SKU
+),
+-- Allergens the recipe IMPLIES, derived from the ingredient names. Compared against the
+-- DECLARED containment type below: an implied allergen carried only as "may_contain" is a
+-- mis-declaration, not a conservative one. One ingredient can imply several allergens
+-- ("Erythritol blend + whey protein isolate" = Polyols AND Dairy), so each allergen is an
+-- independent test rather than a first-match CASE.
+--
+-- ponytail: keyword heuristic. The real fix is an ALLERGEN_ID column on DIM_INGREDIENT;
+-- until the PIM has one, decoy words are stripped before matching (nutmeg/coconut are not
+-- tree nuts; cocoa/peanut butter are not dairy).
+ing_allergen AS (
+  SELECT
+    m.SKU,
+    REGEXP_REPLACE(LOWER(i.INGREDIENT_NAME), r'nutmeg|coconut', '') AS n_nut,
+    REGEXP_REPLACE(LOWER(i.INGREDIENT_NAME), r'cocoa butter|peanut butter|nut butter|shea butter', '') AS n_dairy,
+    LOWER(i.INGREDIENT_NAME) AS n
+  FROM `gen-lang-client-0520145261.ctx_upside_master_data.MAP_PRODUCT_INGREDIENT` m
+  JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_INGREDIENT` i USING (INGREDIENT_ID)
+),
+alg_implied AS (
+  SELECT SKU, STRING_AGG(DISTINCT a, ', ' ORDER BY a) AS ALLERGEN_IMPLIED_BY_RECIPE
+  FROM ing_allergen,
+  UNNEST(ARRAY(SELECT x FROM UNNEST([
+    IF(REGEXP_CONTAINS(n_nut,   r'almond|cashew|walnut|pistachio|hazelnut|pecan|peanut|\bnuts?\b'), 'Nuts',    NULL),
+    IF(REGEXP_CONTAINS(n_dairy, r'\bmilk|cream|\bbutter|cheese|paneer|khoya|ghee|curd|yoghurt|yogurt|whey|casein|mawa|malai|rabdi'), 'Dairy', NULL),
+    IF(REGEXP_CONTAINS(n,       r'\begg|albumen'),                                                   'Eggs',    NULL),
+    IF(REGEXP_CONTAINS(n,       r'erythritol|xylitol|maltitol|sorbitol|mannitol|lactitol|isomalt|polyol'), 'Polyols', NULL)
+  ]) x WHERE x IS NOT NULL)) AS a
+  GROUP BY SKU
+),
+clm AS (
+  SELECT SKU,
+         STRING_AGG(HIGHLIGHT_TEXT, ' | ' ORDER BY HIGHLIGHT_SEQ) AS CLAIMS,
+         COUNT(*) AS CLAIM_COUNT
+  FROM `gen-lang-client-0520145261.ctx_upside_master_data.PRODUCT_HIGHLIGHT`
+  GROUP BY SKU
+),
+chk AS (
+  SELECT SKU,
+         COUNTIF(VERDICT IN ('MISMATCH', 'CONTRADICTED', 'MALFORMED_CLAIM')) AS CLAIM_BLOCKING_COUNT,
+         COUNTIF(VERDICT IN ('review_tolerance', 'basis_unknown', 'no_lab_value', 'needs_threshold_check')) AS CLAIM_REVIEW_COUNT,
+         COUNTIF(VERDICT = 'substantiated') AS CLAIM_SUBSTANTIATED_COUNT,
+         -- Only the failing claims, in full (no preview truncation): this is what the
+         -- reviewer and the agent must read before anything is published.
+         STRING_AGG(
+           IF(VERDICT IN ('MISMATCH', 'CONTRADICTED', 'MALFORMED_CLAIM'),
+              FORMAT('%s -> lab %s %s (%s), %s%%: %s',
+                     CLAIM_TEXT,
+                     IFNULL(CAST(LAB_VALUE_COMPARED AS STRING), 'n/a'), IFNULL(LAB_UNIT, ''),
+                     IFNULL(CLAIM_BASIS, ''), IFNULL(CAST(DEVIATION_PCT AS STRING), 'n/a'), VERDICT),
+              NULL),
+           '; ' ORDER BY HIGHLIGHT_SEQ) AS CLAIM_FAILURES
+  FROM `gen-lang-client-0520145261.ctx_upside_master_data.V_LISTING_CLAIM_CHECK`
+  GROUP BY SKU
+),
+pan AS (
+  SELECT SKU,
+         ANY_VALUE(NUTRIENT_BASIS) AS NUTRIENT_BASIS,
+         ANY_VALUE(PANEL_SERVING_GM) AS PANEL_SERVING_GM,
+         -- FSSAI-ordered panel as one printable string, so the whole panel reaches the
+         -- listing (and the LLM) in a single 1:1 fact instead of a previewed row list.
+         STRING_AGG(
+           FORMAT('%s: %s %s%s', NUTRIENT, IFNULL(CAST(VALUE AS STRING), 'MISSING'), IFNULL(UNIT, ''),
+                  IF(DV_PCT IS NULL, '', FORMAT(' (%s%% RDA)', CAST(DV_PCT AS STRING)))),
+           '; ' ORDER BY PANEL_ORDER) AS NUTRITION_PANEL,
+         COUNTIF(IS_FSSAI_MANDATORY AND NOT VALUE_MISSING) AS MANDATORY_NUTRIENTS_PRESENT,
+         STRING_AGG(IF(IS_FSSAI_MANDATORY AND VALUE_MISSING, NUTRIENT, NULL), ', ' ORDER BY PANEL_ORDER) AS MANDATORY_NUTRIENTS_BLANK
+  FROM `gen-lang-client-0520145261.ctx_upside_master_data.V_PRODUCT_NUTRIENT_CLEAN`
+  GROUP BY SKU
+),
+base AS (
+  SELECT
+    p.SKU, p.DISPLAY_NAME, p.FLAVOUR, p.SIZE_LABEL, p.SIZE_GM, p.VEG_NONVEG, p.VERSION,
+    p.STATUS, p.IS_ACTIVE, NULLIF(TRIM(IFNULL(p.DESCRIPTION, '')), '') AS DESCRIPTION,
+    NULLIF(TRIM(IFNULL(p.IMAGES_LINK, '')), '') AS IMAGES_LINK,
+    cat.CATEGORY_NAME, pl.PRODUCT_LINE_NAME,
+    pr.MRP_INR, pr.GST_RATE, pr.BASE_PRICE_INR, pr.TOTAL_COGS_INR, pr.SHELF_LIFE_DAYS,
+    pk.PACKAGING_TYPE, NULLIF(TRIM(IFNULL(pk.GS1_BARCODE, '')), '') AS GS1_BARCODE,
+    -- The 14-digit FSSAI licence, pulled out of the free-text legal block that the
+    -- product-information sheet keeps it in ("(2) Lic.No-11524036000508").
+    REGEXP_EXTRACT(IFNULL(pk.ORG_LABELLING_COMPLIANCE, ''), r'(\d{14})') AS FSSAI_LICENCE_NO,
+    TRIM(REGEXP_EXTRACT(IFNULL(pk.ORG_LABELLING_COMPLIANCE, ''), r'(?i)marketed by:?\s*([^\n]+)')) AS MANUFACTURER,
+    NULLIF(TRIM(IFNULL(pk.STORAGE_GUIDELINES, '')), '') AS STORAGE_GUIDELINES,
+    NULLIF(TRIM(IFNULL(pk.CONSUMPTION_INSTRUCTIONS, '')), '') AS CONSUMPTION_INSTRUCTIONS,
+    NULLIF(TRIM(IFNULL(pk.BRAND_POSITIONING, '')), '') AS BRAND_POSITIONING,
+    NULLIF(TRIM(IFNULL(nu.SERVING_SIZE, '')), '') AS SERVING_SIZE,
+    NULLIF(TRIM(IFNULL(nu.LAB_REPORT_LINK, '')), '') AS LAB_REPORT_LINK,
+    nu.REPORT_VALIDITY,
+    IF(nu.REPORT_VALIDITY IS NULL, NULL, DATE_DIFF(CURRENT_DATE(), nu.REPORT_VALIDITY, DAY)) AS LAB_REPORT_AGE_DAYS
+  FROM `gen-lang-client-0520145261.ctx_upside_master_data.DIM_PRODUCT` p
+  LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_CATEGORY`     cat ON cat.CATEGORY_ID = p.CATEGORY_ID
+  LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_PRODUCT_LINE` pl  ON pl.PRODUCT_LINE_ID = p.PRODUCT_LINE_ID
+  LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.PRODUCT_PRICING`   pr USING (SKU)
+  LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.PRODUCT_PACKAGING` pk USING (SKU)
+  LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.PRODUCT_NUTRITION` nu USING (SKU)
+),
+joined AS (
+  SELECT
+    b.*,
+    COALESCE(ing.INGREDIENT_LIST, ding.INGREDIENT_LIST) AS INGREDIENT_LIST,
+    IFNULL(COALESCE(ing.INGREDIENT_COUNT, ding.INGREDIENT_COUNT), 0) AS INGREDIENT_COUNT,
+    CASE WHEN ing.SKU IS NOT NULL THEN 'own'
+         WHEN ding.SKU IS NOT NULL THEN CONCAT('inherited_from:', dn.DONOR_SKU)
+         ELSE 'missing' END AS INGREDIENT_SOURCE,
+    alg.ALLERGEN_CONTAINS, alg.ALLERGEN_MAY_CONTAIN, IFNULL(alg.ALLERGEN_ROWS, 0) AS ALLERGEN_ROWS,
+    COALESCE(ai.ALLERGEN_IMPLIED_BY_RECIPE, dai.ALLERGEN_IMPLIED_BY_RECIPE) AS ALLERGEN_IMPLIED_BY_RECIPE,
+    clm.CLAIMS, IFNULL(clm.CLAIM_COUNT, 0) AS CLAIM_COUNT,
+    IFNULL(chk.CLAIM_BLOCKING_COUNT, 0) AS CLAIM_BLOCKING_COUNT,
+    IFNULL(chk.CLAIM_REVIEW_COUNT, 0) AS CLAIM_REVIEW_COUNT,
+    IFNULL(chk.CLAIM_SUBSTANTIATED_COUNT, 0) AS CLAIM_SUBSTANTIATED_COUNT,
+    chk.CLAIM_FAILURES,
+    IFNULL(pan.NUTRIENT_BASIS, 'no_panel') AS NUTRIENT_BASIS,
+    pan.PANEL_SERVING_GM, pan.NUTRITION_PANEL,
+    IFNULL(pan.MANDATORY_NUTRIENTS_PRESENT, 0) AS MANDATORY_NUTRIENTS_PRESENT,
+    pan.MANDATORY_NUTRIENTS_BLANK
+  FROM base b
+  LEFT JOIN ing            ON ing.SKU = b.SKU
+  LEFT JOIN donor dn       ON dn.SKU = b.SKU
+  LEFT JOIN ing ding       ON ding.SKU = dn.DONOR_SKU          -- donor's recipe
+  LEFT JOIN alg_implied dai ON dai.SKU = dn.DONOR_SKU           -- donor's implied allergens
+  LEFT JOIN alg            ON alg.SKU = b.SKU
+  LEFT JOIN alg_implied ai ON ai.SKU = b.SKU
+  LEFT JOIN clm            ON clm.SKU = b.SKU
+  LEFT JOIN chk            ON chk.SKU = b.SKU
+  LEFT JOIN pan            ON pan.SKU = b.SKU
+),
+-- Allergens the recipe implies but that are declared only as "may contain" (or not
+-- declared at all). Set-difference done in SQL so the gate is deterministic.
+mis AS (
+  SELECT
+    j.SKU,
+    ARRAY_TO_STRING(ARRAY(
+      SELECT a FROM UNNEST(SPLIT(IFNULL(j.ALLERGEN_IMPLIED_BY_RECIPE, ''), ', ')) a
+      WHERE a != '' AND a NOT IN UNNEST(SPLIT(IFNULL(j.ALLERGEN_CONTAINS, ''), ', '))
+    ), ', ') AS ALLERGEN_UNDERDECLARED
+  FROM joined j
+)
+SELECT
+  j.*,
+  NULLIF(m.ALLERGEN_UNDERDECLARED, '') AS ALLERGEN_UNDERDECLARED,
+  -- ---- Deterministic readiness ------------------------------------------------
+  -- BLOCKING: a marketplace or FSSAI would reject the listing (or it would be a
+  -- mis-declaration). WARNING: publishable, but the listing is thin or unverified.
+  ARRAY_TO_STRING(ARRAY(SELECT g FROM UNNEST([
+    IF(j.FSSAI_LICENCE_NO IS NULL, 'No FSSAI licence number on record', NULL),
+    IF(j.MRP_INR IS NULL, 'No MRP', NULL),
+    IF(j.SIZE_LABEL IS NULL, 'No net quantity', NULL),
+    IF(j.VEG_NONVEG IS NULL, 'No veg / non-veg mark', NULL),
+    IF(j.INGREDIENT_SOURCE = 'missing', 'No ingredient list (and no sibling SKU to inherit one from)', NULL),
+    IF(j.ALLERGEN_ROWS = 0, 'No allergen declaration', NULL),
+    IF(j.NUTRITION_PANEL IS NULL, 'No nutrition panel', NULL),
+    IF(j.NUTRIENT_BASIS = 'unknown',
+       'Nutrition panel basis unknown (per 100 g vs per serving cannot be established)', NULL),
+    IF(j.MANDATORY_NUTRIENTS_BLANK IS NOT NULL,
+       CONCAT('FSSAI-mandatory nutrients blank: ', j.MANDATORY_NUTRIENTS_BLANK), NULL),
+    IF(m.ALLERGEN_UNDERDECLARED != '',
+       CONCAT('Allergen under-declared (recipe contains it, label says may-contain/absent): ', m.ALLERGEN_UNDERDECLARED), NULL),
+    IF(j.CLAIM_BLOCKING_COUNT > 0,
+       FORMAT('%d on-pack claim(s) contradicted by the lab panel', j.CLAIM_BLOCKING_COUNT), NULL)
+  ]) g WHERE g IS NOT NULL), '; ') AS BLOCKING_GAPS,
+  ARRAY_TO_STRING(ARRAY(SELECT g FROM UNNEST([
+    IF(STARTS_WITH(j.INGREDIENT_SOURCE, 'inherited'),
+       CONCAT('Ingredient list ', j.INGREDIENT_SOURCE, ' (same line + flavour, different pack size) — confirm before publishing'), NULL),
+    -- FSSAI requires the ingredient list in descending order of weight. MAP_PRODUCT_
+    -- INGREDIENT carries no quantity, so the order below is sheet order, not verified.
+    IF(j.INGREDIENT_COUNT > 1, 'Ingredient order is sheet order — descending-by-weight not verifiable from PIM', NULL),
+    IF(j.IMAGES_LINK IS NULL, 'No product image folder', NULL),
+    IF(j.DESCRIPTION IS NULL, 'No product description', NULL),
+    IF(j.LAB_REPORT_LINK IS NULL, 'No nutrition lab report on file', NULL),
+    IF(j.LAB_REPORT_AGE_DAYS IS NULL, 'Lab report has no issue date', NULL),
+    IF(j.LAB_REPORT_AGE_DAYS > 730, FORMAT('Lab report is %d days old', j.LAB_REPORT_AGE_DAYS), NULL),
+    IF(j.NUTRIENT_BASIS = 'per_100g_inferred',
+       'Nutrition basis inferred from the serving row, not printed on the panel', NULL),
+    IF(j.NUTRIENT_BASIS LIKE 'per_100g%' AND j.PANEL_SERVING_GM IS NOT NULL AND j.PANEL_SERVING_GM != 100,
+       FORMAT('Panel is per 100 g but declares a %s g serving — per-serving column not on file', CAST(j.PANEL_SERVING_GM AS STRING)), NULL),
+    IF(j.STORAGE_GUIDELINES IS NULL, 'No storage instructions', NULL),
+    IF(j.CONSUMPTION_INSTRUCTIONS IS NULL, 'No consumption / serving instructions', NULL),
+    IF(j.GS1_BARCODE IS NULL, 'No GS1 barcode', NULL),
+    IF(j.MANUFACTURER IS NULL, 'No manufacturer name / address parsed', NULL),
+    IF(j.CLAIM_COUNT = 0, 'No marketing claims on record', NULL),
+    IF(j.CLAIM_REVIEW_COUNT > 0,
+       FORMAT('%d claim(s) unverifiable from PIM or outside tolerance', j.CLAIM_REVIEW_COUNT), NULL)
+  ]) g WHERE g IS NOT NULL), '; ') AS WARNING_GAPS
+FROM joined j
+JOIN mis m USING (SKU);
+
+-- Per-channel commercial terms with the channel NAMED (MAP_PRODUCT_CHANNEL stores only
+-- CHANNEL_ID). Every SKU is mapped to all 15 channels with identical price/COGS/shelf
+-- life today, so this is the channel's terms of record, not evidence of being listed --
+-- the target channel is an input to the process, never inferred from these rows.
+CREATE OR REPLACE VIEW `gen-lang-client-0520145261.ctx_upside_master_data.V_LISTING_CHANNEL_PRICING` AS
+SELECT
+  m.SKU,
+  m.CHANNEL_ID,
+  c.CHANNEL_NAME,
+  c.CHANNEL_TYPE,
+  m.APPLICABLE,
+  m.CHANNEL_MRP_INR,
+  m.CHANNEL_GST_RATE,
+  m.CHANNEL_BASE_PRICE_INR,
+  m.CHANNEL_COGS_INR,
+  m.CHANNEL_SHELF_LIFE_DAYS,
+  m.PRIMARY_SALES_OWNER
+FROM `gen-lang-client-0520145261.ctx_upside_master_data.MAP_PRODUCT_CHANNEL` m
+JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_CHANNEL` c USING (CHANNEL_ID);

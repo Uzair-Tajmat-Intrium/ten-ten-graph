@@ -317,7 +317,11 @@ processes:
           observed range, and how much net-new sourcing it needs.
         after: check_ingredient_availability
         fetch:
-          entity_type: ProductLine
+          # entity_type was ProductLine until that type was demoted to a
+          # ProductCategory hierarchy level (2026-09-23). Product is the carrier type;
+          # the catalog row for V_PRODUCT_LINE_CAPABILITY was re-homed to match, and
+          # the (entity_type, dataset) pair MUST agree with it or this read 404s.
+          entity_type: Product
           source_table: V_PRODUCT_LINE_CAPABILITY
           columns: [PRODUCT_LINE_NAME, CATEGORY_NAME, ACTIVE_SKUS, MIN_COGS_INR, MAX_COGS_INR, AVG_SHELF_LIFE_DAYS]
           order_by: CATEGORY_NAME

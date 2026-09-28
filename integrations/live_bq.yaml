@@ -17,13 +17,18 @@ connection:
   credentials: ${env.GOOGLE_APPLICATION_CREDENTIALS_JSON}
 
 # Slow-vs-fast split (2026-07): the MASTER_* slow tables plus the static
-# transfer_route edge are materialised on apply. The fast-moving tables that
-# used to live here (InventoryBatch, Review, Complaint entities; stocked_at,
-# forecast_for, batch_of_product, batch_at_store, review_about_store,
-# complaint_about_store edges) are NOT fetched on apply anymore — they are
-# declared as lazy dataset links in technical_assets/catalog/link_datasets.yaml
-# (fetched on demand at widget render time via this same `live_bq` connection).
-# This connection block is what those links resolve to via `connection: live_bq`.
+# transfer_route edge are materialised on apply. The fast-moving tables are NOT
+# fetched on apply — they are declared as lazy dataset links in
+# technical_assets/catalog/link_datasets.yaml (fetched on demand at widget render
+# time via this same `live_bq` connection). This connection block is what those
+# links resolve to via `connection: live_bq`.
+#
+# 2026-09-23: that split left behind entity types nothing populated. The
+# InventoryBatch, Review, Complaint and Campaign node types — and the
+# stocked_at-adjacent batch_of_product / batch_at_store / review_about_store /
+# complaint_about_store / complaint_about_product / targets_segment edges — have
+# now been removed from the ontology. The data is unchanged: it was already, and
+# still is, served entirely by the Store- and Product-keyed links in that catalog.
 
 entities:
   - type: Store

@@ -260,7 +260,7 @@ processes:
 
       # 4. Email the structured change request to the designer via the Genzoic Email
       #    Formatter skill (clean HTML table + plain-text fallback, over the org's
-      #    SendGrid connector) — same pattern as demand_forecast / customer_review.
+      #    SendGrid connector) — same pattern as inventory_optimization.
       #    STEP action => BARE {{fact}} templating; single-token {{...}} preserves the
       #    native row-list the skill's `records` needs.
       - id: send_change_request

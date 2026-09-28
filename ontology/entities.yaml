@@ -1,43 +1,29 @@
-# Business entity types for the product-master (better-for-you snacks) graph.
-# 22 node types across 5 tiers. Foreign keys are OMITTED from properties —
+# Business entity types for the ten-ten graph.
+# 9 node types across 5 tiers. Foreign keys are OMITTED from properties —
 # they appear as graph relationships instead (see relationships.yaml).
 #
 # Residency of the data behind each type:
-#   PIM      -> erp-setup.product_master           (extracted, integrations/pim_bq.yaml)
-#   LIVE     -> erp-setup.bronze/silver/gold       (extracted, integrations/live_bq.yaml)
-#   CURATED  -> authored in-graph, no table yet    (like Monginis' Deal)
-#   HYBRID   -> warehouse text + curated status
+#   PIM      -> erp-setup.ctx_upside_master_data  (extracted, integrations/pim_bq.yaml)
+#   LIVE     -> erp-setup.bronze/silver/gold      (extracted, integrations/live_bq.yaml)
+#   CURATED  -> authored in-graph, no table yet
+#
+# A type earns its place here only if an instance has a stable business id,
+# someone opens it and decides something about it, and other data hangs off it.
+# Fast-moving events (reviews, complaints, inventory batches, campaign
+# performance) are lazy dataset links on the entity they happen AT — see
+# technical_assets/catalog/link_datasets.yaml. Taxonomy (category, product
+# line) is the ProductCategory hierarchy, attached to Product properties below.
 
 entities:
-
-  # ---- Tier 0 : Business identity (CURATED, authored in-graph) ----------
-  # Read by the competitive-pricing skill to build the business profile
-  # (brand + category + city). One Company/Brand instance is enough for the
-  # profile to resolve; `brand`, `category` and `city` are the fields it uses.
-  - type: Company
-    description: The operating company that owns the graph. Anchors the competitive-pricing business profile.
-    properties:
-      - { name: name,     type: string, required: true }
-      - { name: brand,    type: string }
-      - { name: category, type: string }
-      - { name: city,     type: string }
-      - { name: country,  type: string }
-      - { name: pincode,  type: string }
-
-  - type: Brand
-    description: A brand the company sells under. Same as Company when the company is single-brand.
-    properties:
-      - { name: name,     type: string, required: true }
-      - { name: category, type: string }
-      - { name: city,     type: string }
-      - { name: country,  type: string }
-      - { name: pincode,  type: string }
 
   # ---- Tier 1 : Product / PIM spine -------------------------------------
   - type: Product
     description: A sellable SKU — the pivot of the graph. Fed by product_master, matched to live data by SKU.
     properties:
       - { name: name,                     type: string, required: true }   # DISPLAY_NAME
+      - { name: brand,                    type: string }
+      - { name: category,                 type: reference, references: ProductCategory }
+      - { name: product_line,             type: reference, references: ProductCategory }
       - { name: flavour,                  type: string }
       - { name: size_gm,                  type: number }
       - { name: size_label,               type: string }
@@ -57,16 +43,6 @@ entities:
       - { name: org_labelling_compliance, type: string }
       - { name: serving_size,             type: string }
 
-  - type: Category
-    description: Top of the product taxonomy (Desserts, Health Bars, Snacks, Mithai, Savories, Dessert bites).
-    properties:
-      - { name: name, type: string, required: true }
-
-  - type: ProductLine
-    description: A product type within a category (Cheesecake, Brownie, Tiramisu, ...).
-    properties:
-      - { name: name, type: string, required: true }
-
   - type: Ingredient
     description: A raw or processed ingredient used in product recipes.
     properties:
@@ -75,11 +51,6 @@ entities:
 
   - type: Allergen
     description: A declared allergen (Nuts, Dairy, Eggs, Polyols).
-    properties:
-      - { name: name, type: string, required: true }
-
-  - type: Nutrient
-    description: A nutrition-panel line item (Calories, Protein, Sugars, Sodium, ...).
     properties:
       - { name: name, type: string, required: true }
 
@@ -120,54 +91,9 @@ entities:
       - { name: type,                 type: string }
       - { name: location_description, type: string }
 
-  - type: InventoryBatch
-    description: One store's stock of one SKU in one batch on one day — the grain for precise expiry & liquidation.
-    properties:
-      - { name: snapshot_date,      type: string }
-      - { name: batch_row_number,   type: number }
-      - { name: available_quantity, type: number }
-      - { name: expiry_date,        type: string }
-      - { name: batch_hash,         type: string }
-
-  # ---- Tier 4 : Compliance & Innovation (curated / hybrid) -------------
-  # The Innovation half of this tier. Backs DIM_IDEA, which idea_capture_triage
-  # reads via V_TRIAGE_SIMILARITY_CANDIDATES. Declared so the ideas that process
-  # judges similar surface under their own "IDEA" heading on the Full Context tab
-  # rather than being lumped in with real SKUs under Product. Note that IDEA_ID
-  # (e.g. IDE-002) is not projected as a node id today — the triage sweep labels
-  # its cards from the row data, so no Idea node has to exist for the tab to read
-  # correctly, but an id-based graph link will not resolve until ideas are
-  # projected.
-  - type: Idea
-    description: A pipeline product idea from DIM_IDEA, pre-SKU. Advances through IdeaStage on triage.
-    properties:
-      - { name: name,             type: string, required: true }   # NAME
-      - { name: stage,            type: reference, references: IdeaStage }
-      - { name: hypothesis,       type: string }
-      - { name: thesis_fit,       type: string }
-      - { name: target_cogs_inr,  type: number }
-
-  - type: Regulation
-    description: An FSSAI (or other) rule. Curated; drives the regulation-impact process.
-    properties:
-      - { name: name,           type: string, required: true }
-      - { name: authority,      type: string }
-      - { name: status,         type: reference, references: RegulationStatus }
-      - { name: effective_date, type: string }
-      - { name: summary,        type: string }
-      - { name: citation,       type: string }
-
-  - type: Certification
-    description: A supplier / product certificate (BRC, FSSAI, Organic, HACCP) with grade & expiry. Curated.
-    properties:
-      - { name: name,        type: string, required: true }
-      - { name: cert_type,   type: reference, references: CertificationType }
-      - { name: grade,       type: string }
-      - { name: issued_date, type: string }
-      - { name: expiry_date, type: string }
-      - { name: status,      type: reference, references: CertificationStatus }
-      - { name: coa_link,    type: string }
-
+  # ---- Tier 4 : Supply (curated, no table yet) -------------------------
+  # Declared roadmap, kept deliberately: nothing extracts Supplier today, so
+  # supplies_ingredient cannot populate and supplier_coa_renewal cannot fire.
   - type: Supplier
     description: An ingredient supplier (in ERPNext today; extracted later). Curated for now.
     properties:
@@ -179,34 +105,7 @@ entities:
       - { name: lead_time_days,  type: number }
       - { name: is_active,       type: boolean }
 
-  - type: Claim
-    description: An on-pack / marketing claim. Text from PRODUCT_HIGHLIGHT; type & status curated (hybrid).
-    properties:
-      - { name: text,               type: string, required: true }
-      - { name: claim_type,         type: reference, references: ClaimType }
-      - { name: status,             type: reference, references: ClaimStatus }
-      - { name: substantiation_ref, type: string }
-
   # ---- Tier 5 : Customer -----------------------------------------------
-  - type: Review
-    description: A customer review / star rating (store-level).
-    properties:
-      - { name: text,          type: string }
-      - { name: star_rating,   type: number }
-      - { name: review_date,   type: string }
-      - { name: source,        type: reference, references: ReviewSource }
-      - { name: customer_name, type: string }
-
-  - type: Complaint
-    description: A customer complaint. Carries the item name, so it's product-linkable.
-    properties:
-      - { name: issue_type,            type: reference, references: IssueType }
-      - { name: item_name,             type: string }
-      - { name: customer_comments,     type: string }
-      - { name: source,                type: string }
-      - { name: order_id,              type: string }
-      - { name: complaint_received_at, type: string }
-
   - type: CustomerSegment
     description: A marketing audience segment, per channel.
     properties:
@@ -214,13 +113,3 @@ entities:
       - { name: code,      type: string }
       - { name: channel,   type: string }
       - { name: is_active, type: boolean }
-
-  - type: Campaign
-    description: An ad / marketing campaign. Id from marketing data; attributes curated (hybrid).
-    properties:
-      - { name: name,       type: string, required: true }
-      - { name: channel,    type: string }
-      - { name: city,       type: string }
-      - { name: start_date, type: string }
-      - { name: end_date,   type: string }
-      - { name: budget_rs,  type: number }

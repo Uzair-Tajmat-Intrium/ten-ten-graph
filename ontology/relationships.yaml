@@ -1,37 +1,24 @@
-# How the 20 entity types relate. 30 relationships. The number in each
-# comment matches the numbered ontology map in the explainer artifact.
+# How the 9 entity types relate. 11 relationships.
 # integrations/*.yaml maps the extractable ones to BigQuery tables/views;
-# curated edges (no table) are declared here but not extracted (like
-# Monginis' Deal edges).
+# curated edges (no table) are declared here but not extracted.
+#
+# Category / ProductLine edges are gone — that taxonomy is the ProductCategory
+# hierarchy attached to Product.category / Product.product_line.
+# Review / Complaint / InventoryBatch / Campaign edges are gone — that data is
+# lazy dataset links on Store and Product (technical_assets/catalog).
+# Claim / Nutrient edges are gone — V_LISTING_CLAIM_CHECK and
+# V_PRODUCT_NUTRIENT_CLEAN carry the same facts, plus the lab verdict.
 
 relationships:
 
   # ---- Product structure & recipe --------------------------------------
-  - type: in_product_line          # 1
-    description: A product belongs to a product line.
-    from: Product
-    to:   ProductLine
-    cardinality: many-to-one
-
-  - type: line_in_category         # 2
-    description: A product line rolls up to a category.
-    from: ProductLine
-    to:   Category
-    cardinality: many-to-one
-
-  - type: in_category              # 3
-    description: A product belongs to a category (denormalised on DIM_PRODUCT).
-    from: Product
-    to:   Category
-    cardinality: many-to-one
-
-  - type: contains_ingredient      # 4
+  - type: contains_ingredient      # 1
     description: Bill of materials — a product is built from an ingredient.
     from: Product
     to:   Ingredient
     cardinality: many-to-many
 
-  - type: declares_allergen        # 5
+  - type: declares_allergen        # 2
     description: A product declares an allergen (directly or by facility trace).
     from: Product
     to:   Allergen
@@ -39,63 +26,8 @@ relationships:
     edge_properties:
       - { name: contains_type, type: reference, references: ContainsType }
 
-  - type: declares_nutrient        # 6
-    description: A product's nutrition-panel value for a nutrient.
-    from: Product
-    to:   Nutrient
-    cardinality: many-to-many
-    edge_properties:
-      - { name: value,  type: number }
-      - { name: unit,   type: string }
-      - { name: dv_pct, type: number }
-
-  # ---- Compliance & claims ---------------------------------------------
-  - type: claimed_by               # 7
-    description: An on-pack claim is printed on a product.
-    from: Claim
-    to:   Product
-    cardinality: many-to-one
-
-  - type: claim_depends_on_ingredient   # 8  (curated)
-    description: A claim's truth depends on an ingredient (e.g. a colouring for "Natural Colour").
-    from: Claim
-    to:   Ingredient
-    cardinality: many-to-many
-    edge_properties:
-      - { name: dependency_type, type: string }
-
-  - type: substantiated_by_nutrient     # 9  (curated)
-    description: A nutritional claim is substantiated by a nutrient value.
-    from: Claim
-    to:   Nutrient
-    cardinality: many-to-many
-    edge_properties:
-      - { name: asserted_value, type: number }
-      - { name: unit,           type: string }
-
-  - type: restricts_ingredient          # 10 (curated)
-    description: A regulation restricts or bans an ingredient.
-    from: Regulation
-    to:   Ingredient
-    cardinality: many-to-many
-    edge_properties:
-      - { name: restriction_type, type: string }
-      - { name: threshold,        type: string }
-      - { name: effective_date,   type: string }
-
-  - type: certifies_supplier            # 11 (curated)
-    description: A certificate certifies a supplier.
-    from: Certification
-    to:   Supplier
-    cardinality: many-to-one
-
-  - type: certifies_product             # 12 (curated)
-    description: A certificate certifies a product.
-    from: Certification
-    to:   Product
-    cardinality: many-to-many
-
-  - type: supplies_ingredient           # 13 (curated)
+  # ---- Supply (curated; no table feeds this yet) ------------------------
+  - type: supplies_ingredient      # 3  (curated)
     description: A supplier supplies an ingredient.
     from: Supplier
     to:   Ingredient
@@ -105,7 +37,7 @@ relationships:
       - { name: contract_type,    type: reference, references: ContractType }
 
   # ---- Commercial & competition ----------------------------------------
-  - type: listed_on                # 17
+  - type: listed_on                # 4
     description: A product is listed on a sales channel, with per-channel pricing.
     from: Product
     to:   Channel
@@ -119,7 +51,7 @@ relationships:
       - { name: channel_shelf_life_days, type: number }
       - { name: primary_sales_owner,     type: string }
 
-  - type: maps_to_product          # 18 (curated)
+  - type: maps_to_product          # 5  (curated)
     description: A competitor SKU is curator-mapped to one of our products.
     from: CompetitorProduct
     to:   Product
@@ -128,14 +60,14 @@ relationships:
       - { name: match_confidence, type: number }
       - { name: note,             type: string }
 
-  - type: catalogued_by            # 19 (curated)
+  - type: catalogued_by            # 6  (curated)
     description: A competitor product belongs to a competitor brand.
     from: CompetitorProduct
     to:   Competitor
     cardinality: many-to-one
 
   # ---- Operations & live movement --------------------------------------
-  - type: stocked_at               # 20
+  - type: stocked_at               # 7
     description: A product has live inventory at a store, with wastage & expiry flags.
     from: Product
     to:   Store
@@ -150,7 +82,7 @@ relationships:
       - { name: low_stock_flag,                type: string }
       - { name: shelf_life_days,               type: number }
 
-  - type: stock_config_for         # 30 (slow config, materialised like transfer_route)
+  - type: stock_config_for         # 8  (slow config, materialised like transfer_route)
     description: Per-(SKU, store) low-stock thresholds — the config that defines the low_stock_flag / risk-days logic on stocked_at. Slow-moving reference data from bronze.LOW_STOCK_CONFIG.
     from: Product
     to:   Store
@@ -161,7 +93,7 @@ relationships:
       - { name: absolute_risk_count, type: number }
       - { name: is_active,           type: boolean }
 
-  - type: forecast_for             # 21
+  - type: forecast_for             # 9
     description: A product has an ML sales forecast at a store (near-term).
     from: Product
     to:   Store
@@ -172,19 +104,7 @@ relationships:
       - { name: lower_bound,              type: number }
       - { name: upper_bound,              type: number }
 
-  - type: batch_of_product         # 22
-    description: An inventory batch is of a product.
-    from: InventoryBatch
-    to:   Product
-    cardinality: many-to-one
-
-  - type: batch_at_store           # 23
-    description: An inventory batch is held at a store.
-    from: InventoryBatch
-    to:   Store
-    cardinality: many-to-one
-
-  - type: transfer_route           # 24
+  - type: transfer_route           # 10
     description: An inter-store stock-transfer route with distance.
     from: Store
     to:   Store
@@ -194,32 +114,8 @@ relationships:
       - { name: preferred_for_transfer, type: string }
 
   # ---- Customer voice --------------------------------------------------
-  - type: review_about_store       # 25
-    description: A customer review is about a store.
-    from: Review
-    to:   Store
-    cardinality: many-to-one
-
-  - type: complaint_about_store    # 26
-    description: A customer complaint is about a store.
-    from: Complaint
-    to:   Store
-    cardinality: many-to-one
-
-  - type: complaint_about_product  # 27
-    description: A complaint is resolved to a product (via item-name match, lower confidence).
-    from: Complaint
-    to:   Product
-    cardinality: many-to-one
-
-  - type: segment_on_channel       # 28
+  - type: segment_on_channel       # 11
     description: A marketing segment applies to a channel.
     from: CustomerSegment
     to:   Channel
-    cardinality: many-to-one
-
-  - type: targets_segment          # 29 (curated)
-    description: A campaign targets a customer segment.
-    from: Campaign
-    to:   CustomerSegment
     cardinality: many-to-one

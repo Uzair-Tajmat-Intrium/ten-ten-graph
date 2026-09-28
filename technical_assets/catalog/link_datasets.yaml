@@ -1,13 +1,30 @@
-# Lazy dataset links for the fast-moving data that used to be materialised on
-# apply (see integrations/live_bq.yaml). Each link binds an entity TYPE to a
-# BigQuery source table via a join key; NO rows are copied at apply time — the
-# data is fetched on demand, scoped to one entity instance, when a widget below
-# renders on that entity's page. `connection: live_bq` resolves to the live_bq
-# integration's connection block.
+# Dataset links for the fast-moving data that used to be materialised on apply
+# (see integrations/live_bq.yaml). Each binds an entity TYPE to a BigQuery
+# source table. `connection: live_bq` resolves to the live_bq integration's
+# connection block.
 #
-# Join keys: Product.id == SKU (pim_bq maps Product id: SKU); Store.id ==
-# MASTER_STORE_ID (live_bq maps Store id: MASTER_STORE_ID). So the entity id is
-# the join value in every link below.
+# TWO KINDS, and the difference matters — it decides whether a link CREATES
+# entities:
+#
+#   id_column:  this table's rows ARE instances of the entity type. The column
+#               becomes each row's id. Store.id == MASTER_STORE_ID,
+#               Product.id == SKU (pim_bq maps Product id: SKU).
+#   match:      this table is only SCOPED to an already-existing instance —
+#               a list of {entity_property, table_column}. Creates nothing.
+#
+# A single-entry legacy `join_keys:` is silently upgraded to `id_column`
+# (config.upgrade_legacy_join_keys), which is how eight Product links that are
+# NOT SKU-grained — categories, product lines, ideas, and three union/aggregate
+# scan tables — ended up minting Product entities on the first-apply bulk sync.
+# That is where "Desserts", "FAMILIES" and "END_OF_CANDIDATES" came from in the
+# Product list. They are `match:` now (2026-09-23) so they create nothing.
+#
+# Those eight are read cross-type via dataset_search, which resolves a link by
+# (entity_type, source_table) and never looks at id_column/match — so scoping
+# is irrelevant to how they are actually used. Where a real scope exists it is
+# declared honestly (category / product_line, which are now Product properties);
+# where none does, the match names a column that will never equal a SKU, which
+# is the schema's only way to say "never creates entities".
 
 datasets:
   # --- attached to Store -------------------------------------------------
@@ -142,7 +159,7 @@ datasets:
 
   - entity_type: Product
     name: Forecast
-    description: Latest-run demand forecast (next 1-3 days) per store for this product, from the gold BASE table. source_table is dataset-qualified (gold.) so the dataset-read path (widgets + the demand_forecast gather) resolves it in gold, not the connection's default bronze dataset.
+    description: Latest-run demand forecast (next 1-3 days) per store for this product, from the gold BASE table. source_table is dataset-qualified (gold.) so the dataset-read path (widgets + the inventory_optimization gather) resolves it in gold, not the connection's default bronze dataset.
     source_table: gold.FORECAST_RESULTS_UPDATE
     connection: live_bq
     cardinality: "1:m"
@@ -150,7 +167,7 @@ datasets:
       - { entity_attribute: id, table_column: SKU_ID }
     columns: [SKU_ID, MASTER_STORE_ID, FORECAST_DATE, PREDICTED_SALES_QUANTITY, DAYS_AHEAD, IS_LATEST_FORECAST]
 
-  # Same gold forecast table, joined by STORE — lets the demand_forecast
+  # Same gold forecast table, joined by STORE — lets the inventory_optimization
   # gather START from the Store node (per-store forecast read), symmetric with inventory.
   - entity_type: Store
     name: Forecast by store
@@ -204,8 +221,8 @@ datasets:
     source_table: DIM_IDEA
     connection: pim_bq
     cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: IDEA_ID }
+    match:
+      - { entity_property: id, table_column: IDEA_ID }
     columns: [IDEA_ID, NAME, STAGE, HYPOTHESIS, THESIS_FIT, TARGET_COGS_INR, STAGE_ENTERED_AT]
 
   # Read as the `active_briefs` context key, and browsable per idea here.
@@ -217,8 +234,8 @@ datasets:
     source_table: V_IDEA_PRIORITY_INPUTS
     connection: pim_bq
     cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: IDEA_ID }
+    match:
+      - { entity_property: id, table_column: IDEA_ID }
     columns: [IDEA_ID, NAME, STAGE, HYPOTHESIS, THESIS_FIT, TARGET_COGS_INR, DAYS_IN_STAGE, STAGE_RANK, PORTFOLIO_MIN_COGS_INR, PORTFOLIO_MAX_COGS_INR, COGS_FIT]
 
   - entity_type: Product
@@ -261,15 +278,80 @@ datasets:
       - { entity_attribute: id, table_column: INGREDIENT_ID }
     columns: [INGREDIENT_ID, INGREDIENT_NAME, CATEGORY]
 
-  - entity_type: ProductLine
+  # Re-homed from entity_type: ProductLine when that type was demoted to a
+  # ProductCategory hierarchy level (2026-09-23). This read is NOT SKU-grained —
+  # it is product-line-grained and reached cross-type via dataset_search, so
+  # Product is a carrier type here (same pattern as "Category market signal" and
+  # "Triage similarity candidates" below), not a join to one SKU.
+  #
+  # LOAD-BEARING: idea_capture_triage's Assess Feasibility step reads this as a
+  # `required: true` fact. If this link 404s, that fact goes missing and every
+  # idea silently grades NOT_APPLICABLE — no error, just wrong verdicts.
+  - entity_type: Product
     name: Production capability
     description: Product lines actually manufactured today, with active SKU count, COGS range and shelf life. Read by idea_capture_triage's feasibility step.
     source_table: V_PRODUCT_LINE_CAPABILITY
     connection: pim_bq
     cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: PRODUCT_LINE_ID }
+    match:
+      - { entity_property: product_line, table_column: PRODUCT_LINE_NAME }
     columns: [PRODUCT_LINE_ID, PRODUCT_LINE_NAME, CATEGORY_NAME, ACTIVE_SKUS, MIN_COGS_INR, MAX_COGS_INR, AVG_SHELF_LIFE_DAYS]
+
+  # --- listing package (processes/new_listing_creation.yaml) --------------
+  # Four PIM-side reads for building a channel listing. The 1:1 package is the one
+  # the agent reasons over — every long field on it is pre-aggregated to a scalar in
+  # SQL (see sql/views.sql) so a single row carries the whole listing un-previewed;
+  # the three 1:m links below are what the reviewer's tables render from.
+  - entity_type: Product
+    name: Listing package
+    description: Complete listing package for this SKU plus its deterministic FSSAI/marketplace readiness (lazy, 1:1 on SKU).
+    source_table: V_LISTING_PACKAGE
+    connection: pim_bq
+    cardinality: "1:1"
+    join_keys:
+      - { entity_attribute: id, table_column: SKU }
+    columns: [SKU, DISPLAY_NAME, FLAVOUR, SIZE_LABEL, SIZE_GM, VEG_NONVEG, STATUS, IS_ACTIVE, DESCRIPTION,
+              IMAGES_LINK, CATEGORY_NAME, PRODUCT_LINE_NAME, MRP_INR, GST_RATE, SHELF_LIFE_DAYS,
+              PACKAGING_TYPE, GS1_BARCODE, FSSAI_LICENCE_NO, MANUFACTURER, STORAGE_GUIDELINES,
+              CONSUMPTION_INSTRUCTIONS, BRAND_POSITIONING, SERVING_SIZE, LAB_REPORT_LINK, REPORT_VALIDITY,
+              LAB_REPORT_AGE_DAYS, INGREDIENT_LIST, INGREDIENT_COUNT, INGREDIENT_SOURCE, ALLERGEN_CONTAINS,
+              ALLERGEN_MAY_CONTAIN, ALLERGEN_IMPLIED_BY_RECIPE, ALLERGEN_UNDERDECLARED, CLAIMS, CLAIM_COUNT,
+              CLAIM_BLOCKING_COUNT, CLAIM_REVIEW_COUNT, CLAIM_SUBSTANTIATED_COUNT, CLAIM_FAILURES,
+              NUTRIENT_BASIS, PANEL_SERVING_GM, NUTRITION_PANEL, MANDATORY_NUTRIENTS_PRESENT,
+              MANDATORY_NUTRIENTS_BLANK, BLOCKING_GAPS, WARNING_GAPS]
+
+  - entity_type: Product
+    name: Claim substantiation
+    description: Every on-pack claim for this SKU with its lab-panel verdict (lazy, 1:m).
+    source_table: V_LISTING_CLAIM_CHECK
+    connection: pim_bq
+    cardinality: "1:m"
+    join_keys:
+      - { entity_attribute: id, table_column: SKU }
+    columns: [CLAIM_ID, SKU, HIGHLIGHT_SEQ, CLAIM_TEXT, CLAIM_KIND, NUTRIENT, ASSERTED_VALUE, CLAIM_BASIS,
+              PANEL_BASIS, LAB_UNIT, LAB_PER_100G, LAB_PER_SERVING, LAB_VALUE_COMPARED, DEVIATION_PCT, VERDICT]
+
+  - entity_type: Product
+    name: Nutrition panel
+    description: Canonicalised nutrition panel for this SKU in FSSAI print order, with declaration basis (lazy, 1:m).
+    source_table: V_PRODUCT_NUTRIENT_CLEAN
+    connection: pim_bq
+    cardinality: "1:m"
+    join_keys:
+      - { entity_attribute: id, table_column: SKU }
+    columns: [SKU, NUTRIENT, RAW_NAME, VALUE, UNIT, DV_PCT, NUTRIENT_BASIS, PANEL_SERVING_GM,
+              IS_FSSAI_MANDATORY, VALUE_MISSING, PANEL_ORDER]
+
+  - entity_type: Product
+    name: Channel terms
+    description: Per-channel commercial terms of record for this SKU, channel named (lazy, 1:m).
+    source_table: V_LISTING_CHANNEL_PRICING
+    connection: pim_bq
+    cardinality: "1:m"
+    join_keys:
+      - { entity_attribute: id, table_column: SKU }
+    columns: [SKU, CHANNEL_ID, CHANNEL_NAME, CHANNEL_TYPE, APPLICABLE, CHANNEL_MRP_INR, CHANNEL_GST_RATE,
+              CHANNEL_BASE_PRICE_INR, CHANNEL_COGS_INR, CHANNEL_SHELF_LIFE_DAYS, PRIMARY_SALES_OWNER]
 
   - entity_type: Product
     name: Product family names
@@ -284,8 +366,8 @@ datasets:
     source_table: V_PRODUCT_FAMILY_NAMES
     connection: pim_bq
     cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: ID }
+    match:
+      - { entity_property: id, table_column: ID }
     columns: [ID, NM, CG]
 
   - entity_type: Product
@@ -303,8 +385,8 @@ datasets:
     source_table: V_TRIAGE_SIMILARITY_CANDIDATES
     connection: pim_bq
     cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: ID }
+    match:
+      - { entity_property: id, table_column: ID }
     columns: [SRC, ID, NM, D]
 
   - entity_type: Product
@@ -319,8 +401,8 @@ datasets:
     source_table: V_PIPELINE_PRIORITY_CANDIDATES
     connection: pim_bq
     cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: ID }
+    match:
+      - { entity_property: id, table_column: ID }
     columns: [SRC, ID, NAME, DATA]
 
   - entity_type: Product
@@ -332,22 +414,26 @@ datasets:
     source_table: V_CATEGORY_MARKET_SIGNAL
     connection: pim_bq
     cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: CATEGORY_NAME }
+    match:
+      - { entity_property: category, table_column: CATEGORY_NAME }
     columns: [CATEGORY_NAME, UNITS_90D, NET_REVENUE_90D, UNITS_PRIOR_90D, GROWTH_PCT, FORECAST_UNITS_NEXT, ACTIVE_SKUS_IN_CATEGORY, ACTIVE_COMPETITOR_PRODUCTS, DISTINCT_COMPETITORS]
 
-  # --- attached to Category ----------------------------------------------
+  # --- category master (carrier type: Product) -----------------------------
+  # Re-homed from entity_type: Category when that type was demoted to a
+  # ProductCategory hierarchy level (2026-09-23). Category-grained, not
+  # SKU-grained — Product is the carrier type, as for the reads above.
+  #
   # REQUIRED for innovation_pipeline_prioritisation's `active_categories` context key.
   # dataset_search resolves (entity_type, dataset) through THIS catalog, not through the
   # process YAML: without this row the read fails with
-  #   POST /datasets/search -> 404: No dataset linking 'DIM_CATEGORY' to 'Category'.
-  # The key is `required: false`, so that 404 does not fail the run — it fails SILENTLY,
-  # and its real job is to mint Category nodes onto the entity snapshot. A full sweep
-  # resolves no entity from the event, so with this link missing the run ends with
-  # `entities=0`, save_entity_snapshot writes `entities: []`, and the UI hides the whole
-  # Full Context tab (page.tsx TABS.filter). Category.id == CATEGORY_ID, matching the
-  # `post.resolve` spec on that context key ({field: CATEGORY_ID, type: Category}).
-  - entity_type: Category
+  #   POST /datasets/search -> 404: No dataset linking 'DIM_CATEGORY' to 'Product'.
+  # The key is `required: false`, so that 404 does not fail the run — it fails SILENTLY.
+  # Its real job is to put rows on the entity snapshot: a full sweep resolves no entity
+  # from the event, so with this link missing the run ends with `entities=0`,
+  # save_entity_snapshot writes `entities: []`, and the UI hides the whole Full Context
+  # tab (page.tsx TABS.filter). The process's `post.resolve` now mints Product cards
+  # from SKU, so nothing here depends on a Category node existing.
+  - entity_type: Product
     name: Category master
     description: Every product category in the taxonomy (DIM_CATEGORY) — Desserts, Health
       Bars, Snacks, Mithai, Savories, Dessert bites. Read as the `active_categories`
@@ -355,8 +441,8 @@ datasets:
     source_table: DIM_CATEGORY
     connection: pim_bq
     cardinality: "1:m"
-    join_keys:
-      - { entity_attribute: id, table_column: CATEGORY_ID }
+    match:
+      - { entity_property: category, table_column: CATEGORY_NAME }
     columns: [CATEGORY_ID, CATEGORY_NAME]
 
 widgets:
@@ -482,6 +568,31 @@ widgets:
       SELECT SUM(TOTAL) AS VALUE
       FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS`
       WHERE SKU_ID = {{entity_id}} AND ORDER_STATE <> 'Cancelled'
+
+  # Listing readiness on the Product page — the two numbers that decide whether this
+  # SKU can be listed anywhere today, straight off V_LISTING_PACKAGE (no query needed:
+  # the flags are already columns).
+  - entity_type: Product
+    type: table
+    dataset: V_LISTING_PACKAGE
+    title: Listing readiness (FSSAI / marketplace)
+    position: 5
+    config:
+      columns: [BLOCKING_GAPS, WARNING_GAPS, INGREDIENT_SOURCE, NUTRIENT_BASIS, FSSAI_LICENCE_NO]
+      order_by: SKU
+      order_dir: asc
+      limit: 1
+
+  - entity_type: Product
+    type: table
+    dataset: V_LISTING_CLAIM_CHECK
+    title: Claim substantiation vs lab panel
+    position: 6
+    config:
+      columns: [CLAIM_TEXT, CLAIM_KIND, NUTRIENT, ASSERTED_VALUE, LAB_VALUE_COMPARED, LAB_UNIT, DEVIATION_PCT, VERDICT]
+      order_by: HIGHLIGHT_SEQ
+      order_dir: asc
+      limit: 20
 
   # --- CustomerSegment page ---------------------------------------------
   - entity_type: CustomerSegment

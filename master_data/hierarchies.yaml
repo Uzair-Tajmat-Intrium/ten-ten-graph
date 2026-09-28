@@ -8,23 +8,23 @@ hierarchies:
     name: Product Category Hierarchy
     description: Category -> ProductLine taxonomy. Drives portfolio rollups (compliance, COGS, wastage).
     owner: portfolio_team
+    # This is now the ONLY home for the product taxonomy — the Category and
+    # ProductLine entity types were removed (2026-09-23) and Product.category /
+    # Product.product_line reference this hierarchy instead.
+    #
+    # NO HARD-CODED MEMBERS — nodes are added from the UI. The six categories
+    # that used to sit here were a hand-typed copy of DIM_CATEGORY that had
+    # already drifted from it in case ("Dessert Bites" vs "Dessert bites").
+    #
+    # The values to add are the distinct CATEGORY_NAME / PRODUCT_LINE_NAME
+    # pairs on V_LISTING_PACKAGE — the same pairs that populate
+    # Product.category / Product.product_line, so the tree and the per-SKU
+    # values agree. Node ids are slugify(label), e.g. "Dessert bites" ->
+    # dessert_bites.
     levels:
       - { id: category,     label: Category,     order: 1 }
       - { id: product_line, label: "Product Line", order: 2 }
-    members:
-      # `attributes.owner` on desserts/snacks is a scoped-authority tag (not a
-      # new fact — the whole-hierarchy `owner: portfolio_team` above already
-      # names portfolio_team accountable for this taxonomy; this just points
-      # that authority at portfolio_team's placeholder Lead role for two
-      # categories, so the Organization page's scoped-responsibilities /
-      # governed-scopes panels have something real to render). Remove once
-      # per-category ownership is actually decided.
-      - { id: desserts,      label: "Desserts",      level: category, attributes: { owner: portfolio_team_lead, assignment_label: "Category owner (placeholder)" } }
-      - { id: health_bars,   label: "Health Bars",   level: category }
-      - { id: snacks,        label: "Snacks",        level: category, attributes: { owner: portfolio_team_lead, assignment_label: "Category owner (placeholder)" } }
-      - { id: mithai,        label: "Mithai",        level: category }
-      - { id: savories,      label: "Savories",      level: category }
-      - { id: dessert_bites, label: "Dessert Bites", level: category }
+    members: []
 
   - id: Geo
     name: Store Geographic Hierarchy
@@ -34,14 +34,16 @@ hierarchies:
       - { id: region, label: Region, order: 1 }
       - { id: city,   label: City,   order: 2 }
     members:
-      # See the ProductCategory note above — mumbai/pune's `attributes.owner`
-      # is a placeholder scoped-authority tag pointed at supply_chain_team's
-      # Lead role, not a new fact beyond the hierarchy-level owner already set.
+      # Delhi and Bengaluru were removed 2026-09-23: hand-typed in the
+      # 2026-07-14 "Version-1 Dev" commit, and no Store has ever been in either
+      # city. Mumbai and Pune are the real footprint.
+      #
+      # These two stay declared here, unlike ProductCategory's, because they
+      # carry the scoped-authority `attributes.owner` tags the Organization
+      # page renders. Keep them in step with Store.city as the footprint grows.
       - { id: india,   label: "India",   level: region }
       - { id: mumbai,  label: "Mumbai",  level: city, parent: india, attributes: { owner: supply_chain_team_lead, assignment_label: "City owner (placeholder)" } }
       - { id: pune,    label: "Pune",    level: city, parent: india, attributes: { owner: supply_chain_team_lead, assignment_label: "City owner (placeholder)" } }
-      - { id: delhi,   label: "Delhi",   level: city, parent: india }
-      - { id: bengaluru, label: "Bengaluru", level: city, parent: india }
 
   - id: ChannelGroup
     name: Channel Grouping

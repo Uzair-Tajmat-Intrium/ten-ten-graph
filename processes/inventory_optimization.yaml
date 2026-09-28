@@ -1,8 +1,7 @@
 version: 1
 
 processes:
-  # Demand Forecast — per-store actioning. THE demand-forecast process (the one-shot
-  # demand_forecast_dispatch approve-gate has been removed).
+  # Inventory Optimization — per-store actioning of the forecast-vs-stock plan.
   #
   # Walks the assembled per-(store, SKU) plan one STORE at a time — the demand
   # planner approves or skips each store's actions individually (a `type: foreach`
@@ -12,16 +11,16 @@ processes:
   # Stepped/agentic mode (no metadata.steps_display_only): the EventAgent walks the
   # steps. review_plan shows the complete plan and gates the whole run; action_rows
   # is the per-row loop; dispatch_report sends the taken/held summary.
-  - id: demand_forecast
-    name: Demand Forecast
+  - id: inventory_optimization
+    name: Inventory Optimization
     description: |
-      Assembles each dark store's per-(store, SKU) demand plan (transfer / liquidate
+      Assembles each dark store's per-(store, SKU) inventory plan (transfer / liquidate
       / supply-from-factory), then lets the demand planner action it ROW BY ROW:
       approve a row to fire its action
       now, or reject to skip it. When every row has been decided, a single report is
       emailed listing what was actioned and what was held.
 
-      For the agent: `demand_plan` is ALREADY assembled and pre-scored — one row per
+      For the agent: `inventory_plan` is ALREADY assembled and pre-scored — one row per
       at-risk (store, SKU) with `available_quantity`, `expiring_qty`, `forecast_units`
       (ceiled next-3-day demand), `nearest_store_name` (+ `distance_km`) and an
       `action` (`transfer` / `liquidate` / `supply_factory`). At the overview gate,
@@ -37,7 +36,7 @@ processes:
           - { field: id, op: ne, value: __none__ }
 
     triggers:
-      - { type: event, event_type: demand_forecast }
+      - { type: event, event_type: inventory_optimization }
       - { type: manual, allowed_roles: [DemandPlanner] }
 
     inputs:
@@ -51,11 +50,11 @@ processes:
     steps:
       # 1) FIRST GATE — show the COMPLETE plan; gate the whole run.
       - id: review_plan
-        name: Review the demand plan
+        name: Review the inventory plan
         type: decision
         description: Demand planner reviews the full plan and decides whether to action it row by row.
         instruction: >
-          `demand_plan` is the fully-assembled, pre-scored plan. Write a SHORT summary:
+          `inventory_plan` is the fully-assembled, pre-scored plan. Write a SHORT summary:
           how many SKUs to transfer vs liquidate vs supply-from-factory, across how many
           stores, and the most urgent (smallest days_to_expiry). Recommend "Action the
           Plan" to begin actioning the plan row by row; recommend REJECT to hold the
@@ -64,10 +63,10 @@ processes:
         produces:
           - plan_decision
         key_data:
-          - title: "Demand plan — all rows"
+          - title: "Inventory plan — all rows"
             summary: "Per (store, SKU): action, on-hand, forecast, expiring qty and nearest store"
             views:
-              - { view: table, from: demand_plan, columns: [store_name, product_name, action, available_quantity, forecast_units, expiring_qty, days_to_expiry, nearest_store_name, distance_km] }
+              - { view: table, from: inventory_plan, columns: [store_name, product_name, action, available_quantity, forecast_units, expiring_qty, days_to_expiry, nearest_store_name, distance_km] }
 
       # 2) PER-ROW LOOP — one approve/reject gate per (store, SKU). Approve fires the
       #    row's action immediately; reject skips it. Accumulates into
@@ -76,7 +75,7 @@ processes:
         name: Action each store
         type: foreach
         after: review_plan
-        for_each: demand_plan
+        for_each: inventory_plan
         group_by: store_id            # ONE gate per store (~15), not per (store, SKU) row
         description: For each store, review all its recommended actions and approve to take them all, or reject to hold the store.
         instruction: >
@@ -125,10 +124,10 @@ processes:
             operation: send
             args:
               to: "uzairtajmat7@gmail.com"
-              subject: "Demand plan — actions taken vs held (row-by-row review)"
-              title: "Demand Plan — Actions Taken vs Held"
+              subject: "Inventory plan — actions taken vs held (row-by-row review)"
+              title: "Inventory Plan — Actions Taken vs Held"
               intro: >-
-                Row-by-row review of the demand plan is complete. The tables below list the
+                Row-by-row review of the inventory plan is complete. The tables below list the
                 (store, SKU) rows actioned now (transfer / liquidate / supply-from-factory)
                 and those held / skipped this run.
               sections:
@@ -140,9 +139,7 @@ processes:
                   caption: "Held / skipped rows — no action taken"
                   columns: [store_name, product_name, action, available_quantity, forecast_units, expiring_qty, days_to_expiry, nearest_store_name, distance_km]
                   records: "{{rows_held}}"
-              footer_note: "Generated automatically by the Demand Forecast process."
-
-    related_kpis: [ForecastAccuracy, WastageRisk]
+              footer_note: "Generated automatically by the Inventory Optimization process."
 
     metadata:
       version: 2
@@ -154,11 +151,11 @@ processes:
       tools:
         skills: []
 
-      # demand_plan assembly: forecast + inventory joined per (store, SKU), nearest
+      # inventory_plan assembly: forecast + inventory joined per (store, SKU), nearest
       # transferable store via transfer_route, then an action bucket, plus a ceiled
       # `forecast_units` for display.
       context_package:
-        - key: demand_plan
+        - key: inventory_plan
           required: true
           gather:
             collect:

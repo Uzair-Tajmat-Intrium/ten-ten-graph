@@ -91,8 +91,6 @@ processes:
       Persist, per (store, SKU), which risk_type recurs and whether the owner
       acted (transfer / markdown / ignored). Surface repeat offenders first.
 
-    related_kpis: [WastageRisk]   # must reference KPIs defined in master_data/kpis.yaml (unknown = fatal at apply)
-
     # Everything the orchestrator actually reads at run time.
     metadata:
       version: 1

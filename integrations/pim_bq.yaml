@@ -1,9 +1,12 @@
 # PIM integration — erp-set-up.ctx_upside_master_data (static product truth).
-# Maps 7 entity types and 8 relationships to BigQuery tables/views.
-# Helper views (V_PRODUCT_ENRICHED, V_PRODUCT_CLAIM, V_NUTRIENT_DIM) must
-# exist first — see sql/views.sql.
+# Maps 6 entity types and 5 relationships to BigQuery tables/views.
+# Helper view V_PRODUCT_ENRICHED must exist first — see sql/views.sql.
 #
-# Run:  contextgraph apply -C ./product-master-graph -s pim_bq
+# Category / product line are NOT entities — they are the ProductCategory
+# hierarchy, grown from DIM_CATEGORY / DIM_PRODUCT_LINE by the bulk-import
+# config in master_data/hierarchy_bulk_import_configs.yaml.
+#
+# Run:  contextgraph apply -C ./ten-ten-graph -s pim_bq
 
 name: pim_bq
 kind: bigquery
@@ -14,35 +17,17 @@ connection:
   credentials: ${env.GOOGLE_APPLICATION_CREDENTIALS_JSON}
 
 entities:
-  # Business identity — one row in ctx_upside_master_data.COMPANY. Read by the
-  # competitive-pricing skill to build the profile (brand + category + city).
-  # Company and Brand come from the same row (single-brand company).
-  - type: Company
-    table: COMPANY
-    id: COMPANY_ID
-    properties:
-      name:     COMPANY_NAME
-      brand:    BRAND_NAME
-      category: CATEGORY
-      city:     CITY
-      country:  COUNTRY
-      pincode:  PINCODE
-
-  - type: Brand
-    table: COMPANY
-    id: BRAND_NAME
-    properties:
-      name:     BRAND_NAME
-      category: CATEGORY
-      city:     CITY
-      country:  COUNTRY
-      pincode:  PINCODE
-
   - type: Product
     table: V_PRODUCT_ENRICHED              # DIM_PRODUCT + PRICING + PACKAGING + NUTRITION (1:1) on SKU
     id: SKU
     properties:
       name:                     DISPLAY_NAME
+      # Taxonomy as properties, not edges — these two are what the
+      # ProductCategory hierarchy attaches to. Added to V_PRODUCT_ENRICHED
+      # 2026-09-23 (see sql/views.sql); re-run that DDL before applying or
+      # the extract drops both columns and the hierarchy stays at 0 matched.
+      category:                 CATEGORY_NAME
+      product_line:             PRODUCT_LINE_NAME
       flavour:                  FLAVOUR
       size_gm:                  SIZE_GM
       size_label:               SIZE_LABEL
@@ -62,16 +47,6 @@ entities:
       org_labelling_compliance: ORG_LABELLING_COMPLIANCE
       serving_size:             SERVING_SIZE
 
-  - type: Category
-    table: DIM_CATEGORY
-    id: CATEGORY_ID
-    properties: { name: CATEGORY_NAME }
-
-  - type: ProductLine
-    table: DIM_PRODUCT_LINE
-    id: PRODUCT_LINE_ID
-    properties: { name: PRODUCT_LINE_NAME }
-
   - type: Ingredient
     table: DIM_INGREDIENT
     id: INGREDIENT_ID
@@ -82,24 +57,11 @@ entities:
     id: ALLERGEN_ID
     properties: { name: ALLERGEN_NAME }
 
-  - type: Nutrient
-    table: V_NUTRIENT_DIM                   # SELECT DISTINCT NUTRIENT_NAME (empty until nutrient OCR runs)
-    id: NUTRIENT_NAME
-    properties: { name: NUTRIENT_NAME }
-
   - type: Channel
     table: DIM_CHANNEL
     id: CHANNEL_ID
     properties: { name: CHANNEL_NAME, channel_type: CHANNEL_TYPE }
 
-  - type: Claim
-    table: V_PRODUCT_CLAIM                  # PRODUCT_HIGHLIGHT + surrogate CLAIM_ID
-    id: CLAIM_ID
-    properties: { text: HIGHLIGHT_TEXT }
-
-  # Competitive pricing — curated competitor brands + their SKUs (DIM_COMPETITOR,
-  # DIM_COMPETITOR_PRODUCT). Read by the competitive-pricing skill; mirrors the
-  # Monginis graph. CITY on each competitor product must match the scan city.
   - type: Competitor
     table: DIM_COMPETITOR
     id: COMPETITOR_ID
@@ -123,21 +85,6 @@ entities:
       is_active:    IS_ACTIVE
 
 relationships:
-  - type: in_product_line
-    table: DIM_PRODUCT
-    from: { entity: Product,     column: SKU }
-    to:   { entity: ProductLine, column: PRODUCT_LINE_ID }
-
-  - type: in_category
-    table: DIM_PRODUCT
-    from: { entity: Product,  column: SKU }
-    to:   { entity: Category, column: CATEGORY_ID }
-
-  - type: line_in_category
-    table: DIM_PRODUCT_LINE
-    from: { entity: ProductLine, column: PRODUCT_LINE_ID }
-    to:   { entity: Category,    column: CATEGORY_ID }
-
   - type: contains_ingredient
     table: MAP_PRODUCT_INGREDIENT
     from: { entity: Product,    column: SKU }
@@ -149,15 +96,6 @@ relationships:
     to:   { entity: Allergen, column: ALLERGEN_ID }
     edge_properties:
       contains_type: CONTAINS_TYPE
-
-  - type: declares_nutrient
-    table: PRODUCT_NUTRIENT                 # empty until parse_nutrients.py populates it
-    from: { entity: Product,  column: SKU }
-    to:   { entity: Nutrient, column: NUTRIENT_NAME }
-    edge_properties:
-      value:  VALUE
-      unit:   UNIT
-      dv_pct: DV_PCT
 
   - type: listed_on
     table: MAP_PRODUCT_CHANNEL
@@ -172,12 +110,6 @@ relationships:
       channel_shelf_life_days: CHANNEL_SHELF_LIFE_DAYS
       primary_sales_owner:     PRIMARY_SALES_OWNER
 
-  - type: claimed_by
-    table: V_PRODUCT_CLAIM
-    from: { entity: Claim,   column: CLAIM_ID }
-    to:   { entity: Product, column: SKU }
-
-  # CompetitorProduct → our Product (Product id column is SKU here, not PRODUCT_ID).
   - type: maps_to_product
     table: MAP_COMPETITOR_PRODUCT_TO_PRODUCT
     from: { entity: CompetitorProduct, column: COMPETITOR_PRODUCT_ID }
