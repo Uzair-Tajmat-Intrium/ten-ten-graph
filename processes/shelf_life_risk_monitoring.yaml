@@ -10,9 +10,9 @@ processes:
       closes, then emails the supply-chain owner the at-risk report on approval.
 
       For the agent: `at_risk_products` is ALREADY assembled and filtered by the
-      system to at-risk (store, SKU) rows only — rolled up from each store's
-      latest inventory snapshot and scored against that pair's configured
-      thresholds (from the stock_config_for edge). Each row carries a `risk_type`:
+      inventory semantic model to at-risk (store, SKU) rows only — from each
+      store's latest inventory snapshot, scored against that pair's configured
+      low-stock thresholds. Each row carries a `risk_type`:
       `wastage` (near expiry), `low_stock` (below safety stock), `critical_low`
       (below the hard floor) or `both`. Do NOT re-filter or re-list every row.
       Write a SHORT summary: how many SKUs are near-expiry vs low on stock, across
@@ -53,25 +53,18 @@ processes:
     # path so the email action still fires (not routed into the StepRunner).
     steps:
       - id: collect_inventory
-        name: Collect current inventory
+        name: Collect at-risk inventory
         type: agent
-        description: Read each store's latest inventory snapshot (sellable, non-expired stock).
-        instruction: For every store, read the latest STORE_INVENTORY_DAILY snapshot and keep only non-expired, sellable batches.
-        produces: [current_inventory]
-      - id: thresholds
-        name: Attach shelf-life thresholds
-        type: agent
-        after: collect_inventory
-        description: Walk stock_config_for to bring each (SKU, store)'s configured thresholds.
-        instruction: For each (SKU, store) walk the stock_config_for edge and attach min_days_shelf_life, min_count and absolute_risk_count.
-        produces: [thresholds]
+        description: Read the at-risk (store, SKU) pairs from the inventory semantic model.
+        instruction: Run the inventory semantic model's at_risk_store_skus query — the latest snapshot's sellable stock per (store, SKU), already scored against its thresholds.
+        produces: [at_risk_products]
       - id: assess
         name: Assess risk
         type: agent
-        after: thresholds
-        description: Roll up per (store, SKU) and flag wastage / low-stock / critical risk.
-        instruction: Roll up to one row per (store, SKU); classify each as wastage, low_stock, critical_low or both against its thresholds and drop the rest.
-        produces: [at_risk_products]
+        after: collect_inventory
+        description: Summarise wastage / low-stock / critical risk across stores.
+        instruction: Summarise how many SKUs are near-expiry vs low on stock, across how many stores, and call out the most urgent.
+        produces: [risk_summary]
       - id: review
         name: Supply owner review
         type: decision
@@ -91,6 +84,9 @@ processes:
       Persist, per (store, SKU), which risk_type recurs and whether the owner
       acted (transfer / markdown / ignored). Surface repeat offenders first.
 
+    # Display-only; the goal bindings in goals.yaml deliver the values into a run.
+    related_kpis: [near_expiry_units, expiry_value_at_risk_inr, critical_low_pairs]
+
     # Everything the orchestrator actually reads at run time.
     metadata:
       version: 1
@@ -105,76 +101,17 @@ processes:
       tools:
         skills: []
 
-      # Gather before the reviewer sees anything. Graph-native traversal:
-      #   START at Store nodes -> follow the Store->STORE_INVENTORY_DAILY link
-      #   (per store) -> walk Product--stock_config_for-->Store to pull each
-      #   (SKU, store)'s configured thresholds -> roll up to one row per (store,
-      #   SKU) -> flag BOTH wastage (near-expiry) AND low-stock risk.
+      # One named query on the inventory semantic model returns the at-risk (store, SKU)
+      # rows already scored — the latest-snapshot rollup and threshold bucketing live in
+      # V_STORE_STOCK_RISK, so this process and its KPIs share one definition of "at risk".
       context_package:
         - key: at_risk_products
           required: true
-          gather:
-            base:
-              entity: Store                    # start from Store entities (all, or the one on the event)
-              dataset: STORE_INVENTORY_DAILY   # follow the link Store already declares
-              columns: [store_id, product_sku, available_quantity, expiry_date, snapshot_date, batch_row_number]
-              order_by: snapshot_date
-              order_dir: desc
-              limit: 2000                       # rows per store
-            links:
-              - from: product_sku
-                from_type: Product
-                via: stock_config_for
-                direction: out
-                match: store_id
-                bring: [min_days_shelf_life, min_count, absolute_risk_count]
+          source: semantic_model
+          query:
+            model_name: inventory_freshness_semantic_model
+            name: at_risk_store_skus
           post:
-            # 1) keep ONLY each store's most recent snapshot = the batches actually
-            #    on hand now (drops stale batches last seen weeks/months ago).
-            latest_snapshot: { by: [store_id], "on": snapshot_date }
-            # 2) roll batches up to one row per (store, SKU). FIRST drop already-
-            #    expired batches (days_to_expiry < 0) so "available" = sellable
-            #    stock only and nothing expired can surface. Then total on hand,
-            #    the soonest-expiring GOOD batch, and the per-pair thresholds.
-            rollup:
-              group_by: [store_id, product_sku]
-              filter_rows:
-                compute:
-                  - { as: days_to_expiry, days_until: expiry_date }
-                where:
-                  - { field: days_to_expiry, op: gte, value: 0 }   # exclude expired batches
-              agg:
-                - { as: total_available,     op: sum,   col: available_quantity }
-                - { as: soonest_expiry,      op: min,   col: expiry_date }
-                - { as: batches,             op: count, col: batch_row_number }
-                - { as: min_days_shelf_life, op: first, col: min_days_shelf_life }
-                - { as: min_count,           op: first, col: min_count }
-                - { as: absolute_risk_count, op: first, col: absolute_risk_count }
-            # 3) derive days-to-expiry (of the soonest good batch, always >= 0) and
-            #    the single risk_type, scored against the configured thresholds.
-            compute:
-              - { as: days_to_expiry, days_until: soonest_expiry }
-              - as: risk_type
-                bucket:
-                  # near-expiry AND below safety stock
-                  - when:
-                      all:
-                        - { field: days_to_expiry, op: lte, ref: min_days_shelf_life }
-                        - { field: total_available, op: lte, ref: min_count }
-                    value: both
-                  # near-expiry (wastage) only
-                  - { when: { field: days_to_expiry, op: lte, ref: min_days_shelf_life }, value: wastage }
-                  # hard low-stock floor
-                  - { when: { field: total_available, op: lte, ref: absolute_risk_count }, value: critical_low }
-                  # below configured safety stock
-                  - { when: { field: total_available, op: lte, ref: min_count }, value: low_stock }
-                  - { else: ok }
-            # 4) keep only flagged rows; hide the config thresholds (they're the
-            #    rulebook, already known — the report shows current status).
-            where:
-              - { field: risk_type, op: ne, value: ok }
-            drop: [min_days_shelf_life, min_count, absolute_risk_count]
-            sort_by: days_to_expiry
             resolve:
               - { field: store_id, type: Store, as: store_name }
               - { field: product_sku, type: Product, as: product_name }
@@ -194,7 +131,7 @@ processes:
       # NOTE: policy_rules is documentation only — the EventAgent reads `description`
       # (the TASK), not this block; the key guidance is folded into description above.
       policy_rules:
-        - "`at_risk_products` has ALREADY been assembled and filtered by the system to at-risk (store, SKU) rows only, rolled up from the latest inventory snapshot and scored against each pair's configured thresholds (from the stock_config_for edge). Each row has a `risk_type`: `wastage` (near expiry: 0 <= days_to_expiry <= min_days_shelf_life; already-expired stock is excluded), `low_stock` (total_available <= min_count), `critical_low` (total_available <= absolute_risk_count), or `both`. Do NOT re-filter or re-list every row."
+        - "`at_risk_products` has ALREADY been assembled and filtered by the system to at-risk (store, SKU) rows only, from the latest inventory snapshot, scored against each pair's configured thresholds by the inventory semantic model. Each row has a `risk_type`: `wastage` (near expiry: 0 <= days_to_expiry <= min_days_shelf_life; already-expired stock is excluded), `low_stock` (total_available <= min_count), `critical_low` (total_available <= absolute_risk_count), or `both`. Do NOT re-filter or re-list every row."
         - "Write a SHORT decision summary in plain business language covering BOTH risks: how many SKUs are near-expiry (wastage) vs running low on stock, across how many stores, and call out the most urgent — smallest days_to_expiry for wastage, and any `critical_low`/`both` rows. Example tone: 'Store 100008: 3 SKUs expiring within 2 days and 2 SKUs critically low; 6 stores affected overall.' Do not paste the table."
         - "Recommend APPROVE to email the supply-chain owner the combined at-risk report so the manual daily monitoring is captured in writing. If `at_risk_products` is empty, recommend no action (nothing is at risk today)."
 

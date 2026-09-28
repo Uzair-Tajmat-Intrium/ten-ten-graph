@@ -607,6 +607,80 @@ FROM `gen-lang-client-0520145261.bronze.V_COMPLAINT_EVENTS` c
 JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_PRODUCT` p
   ON UPPER(TRIM(c.ITEM_NAME)) = UPPER(TRIM(p.DISPLAY_NAME));
 
+-- Stock risk per (store, SKU) off each store's latest snapshot — the one "at risk"
+-- definition shared by inventory_freshness_semantic_model's KPIs, shelf_life_risk_
+-- monitoring and inventory_optimization (replaces their gather + post pipelines).
+-- Expired batches are excluded; a pair with no sellable batch drops out.
+-- SKU_ID / STORE_ID are the stock_config_for join columns, so the model links to
+-- Product and Store. Thresholds ignore LOW_STOCK_CONFIG.IS_ACTIVE, as the edge did.
+CREATE OR REPLACE VIEW `gen-lang-client-0520145261.bronze.V_STORE_STOCK_RISK` AS
+WITH latest AS (
+  SELECT store_id, product_sku, available_quantity, expiry_date, batch_row_number,
+         DATE_DIFF(expiry_date, CURRENT_DATE(), DAY) AS dte
+  FROM `gen-lang-client-0520145261.bronze.STORE_INVENTORY_DAILY`
+  QUALIFY snapshot_date = MAX(snapshot_date) OVER (PARTITION BY store_id)
+),
+pair AS (
+  SELECT store_id AS STORE_ID, product_sku AS SKU_ID,
+         SUM(available_quantity)                      AS total_available,
+         SUM(IF(dte <= 3, available_quantity, 0))     AS expiring_qty,
+         MIN(expiry_date)                             AS soonest_expiry,
+         MIN(dte)                                     AS days_to_expiry,
+         COUNT(batch_row_number)                      AS batches
+  FROM latest
+  WHERE dte >= 0
+  GROUP BY 1, 2
+)
+SELECT
+  p.*,
+  c.MIN_DAYS_SHELF_LIFE AS min_days_shelf_life,
+  c.MIN_COUNT           AS min_count,
+  c.ABSOLUTE_RISK_COUNT AS absolute_risk_count,
+  v.TOTAL_COGS_INR      AS unit_cogs_inr,
+  CASE
+    WHEN p.days_to_expiry <= c.MIN_DAYS_SHELF_LIFE AND p.total_available <= c.MIN_COUNT THEN 'both'
+    WHEN p.days_to_expiry <= c.MIN_DAYS_SHELF_LIFE THEN 'wastage'
+    WHEN p.total_available <= c.ABSOLUTE_RISK_COUNT THEN 'critical_low'
+    WHEN p.total_available <= c.MIN_COUNT THEN 'low_stock'
+    ELSE 'ok'
+  END AS risk_type
+FROM pair p
+LEFT JOIN `gen-lang-client-0520145261.bronze.LOW_STOCK_CONFIG` c
+  ON c.SKU_ID = p.SKU_ID AND c.STORE_ID = p.STORE_ID
+LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.V_PRODUCT_ENRICHED` v
+  ON v.SKU = p.SKU_ID;
+
+-- Inventory plan inputs per (store, SKU): stock risk FULL JOIN next-3-day latest
+-- forecast, plus the nearest transfer store. inventory_optimization buckets the
+-- action (transfer / liquidate / supply_factory) over these rows in its `post`.
+CREATE OR REPLACE VIEW `gen-lang-client-0520145261.bronze.V_INVENTORY_PLAN_INPUTS` AS
+WITH fc AS (
+  -- ROUND(…, 2) matches the old rollup's rounding, so ceil() gives the same units.
+  SELECT MASTER_STORE_ID AS STORE_ID, SKU_ID, ROUND(SUM(PREDICTED_SALES_QUANTITY), 2) AS forecast_3d
+  FROM `gen-lang-client-0520145261.gold.FORECAST_RESULTS_UPDATE`
+  WHERE IS_LATEST_FORECAST
+    AND DATE_DIFF(FORECAST_DATE, CURRENT_DATE(), DAY) BETWEEN 1 AND 3
+  GROUP BY 1, 2
+),
+nearest AS (
+  SELECT FROM_STORE_ID AS STORE_ID, TO_STORE_ID AS nearest_store_id, DISTANCE_KM AS distance_km
+  FROM `gen-lang-client-0520145261.bronze.V_TRANSFER_ROUTE`
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY FROM_STORE_ID ORDER BY DISTANCE_KM, TO_STORE_ID) = 1
+)
+SELECT
+  COALESCE(r.STORE_ID, f.STORE_ID) AS STORE_ID,
+  COALESCE(r.SKU_ID, f.SKU_ID)     AS SKU_ID,
+  r.total_available                AS available_quantity,
+  r.expiring_qty,
+  r.soonest_expiry,
+  r.days_to_expiry,
+  f.forecast_3d,
+  n.nearest_store_id,
+  n.distance_km
+FROM `gen-lang-client-0520145261.bronze.V_STORE_STOCK_RISK` r
+FULL OUTER JOIN fc f ON f.STORE_ID = r.STORE_ID AND f.SKU_ID = r.SKU_ID
+LEFT JOIN nearest n ON n.STORE_ID = COALESCE(r.STORE_ID, f.STORE_ID);
+
 -- =====================================================================
 -- MARKETING (gen-lang-client-0520145261.bronze)  —  campaigns + segments
 -- =====================================================================
