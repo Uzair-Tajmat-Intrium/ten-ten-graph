@@ -121,24 +121,35 @@ datasets:
       - { entity_attribute: id, table_column: MASTER_STORE_ID }
     columns: [SEGMENT_ID, MASTER_STORE_ID, STORE_NAME, CHANNEL, BUDGET_MONTH, ALLOCATED_BUDGET_RS, EXPECTED_REVENUE_RS]
 
-  # Sales-gap signals for processes/sales_gap_diagnosis.yaml: latest sales week vs the
-  # prior week and the 4-week baseline at STORE (store x channel), CHANNEL and PRODUCT
-  # level, with a DROP / SPIKE flag and the drivers packed into DRIVER_HINTS
-  # (sql/views.sql). `match:` on LEVEL, NOT id_column: CHANNEL / PRODUCT rows carry
-  # MASTER_STORE_ID = 'ALL', and an id_column link would mint a fake "ALL" Store on the
-  # bulk sync. LEVEL never equals a store id, so the link creates nothing; the process
-  # reads it cross-type via dataset_search, which ignores match/id_column.
+  # Sales-gap diagnosis (processes/sales_gap_diagnosis.yaml): three RAW views, see
+  # sql/views.sql. All use `match:` on a column that never equals a store id, NOT id_column:
+  # the views carry MASTER_STORE_ID = 'ALL' rows, and an id_column link would mint a fake
+  # "ALL" Store on the bulk sync. The process reads them cross-type (entity_type), which
+  # ignores match/id_column.
   - entity_type: Store
-    name: Sales gap signals
-    description: Weekly sales/orders/AOV movement vs the prior week and the 4-week baseline, per
-      store x channel, channel and product, with likely drivers and a DROP/SPIKE flag. Read by
-      sales_gap_diagnosis. See sql/views.sql.
-    source_table: V_SALES_GAP_SIGNALS
+    name: Sales gap - store x channel
+    description: Latest sales week vs the prior week and the 4-week baseline, per store x channel
+      plus an 'All stores' row per channel. Raw sales, orders and AOV; Zomato headline marketing
+      (spend/day, ROI, impressions/day, M2O); store complaints, reviews, rating, rain days and
+      occasions. No flags or hints. Read by sales_gap_diagnosis.
+    source_table: V_SALES_GAP_STORE
     connection: live_bq
     cardinality: "1:m"
     match:
-      - { entity_property: id, table_column: LEVEL }
-    columns: [LEVEL, MASTER_STORE_ID, STORE_NAME, CHANNEL, SKU_ID, ITEM_NAME, WEEK_END, DAYS_CUR, SALES_CUR, SALES_PREV, SALES_BASE, WOW_PCT, VS_BASE_PCT, ORDERS_CUR, ORDERS_PREV, ORDERS_CHG_PCT, UNITS_CUR, AOV_CUR, AOV_PREV, AOV_CHG_PCT, AD_SPEND_CUR, AD_SPEND_PREV, IMPRESSIONS_CHG_PCT, COMPLAINTS_CUR, COMPLAINTS_PREV, AVG_RATING_CUR, RAINY_DAYS_CUR, LOW_STOCK_SKUS, LOW_STOCK_STORES, OCCASIONS_CUR, MKT_WEEK_END, MKT_DAYS_CUR, LY_VS_BASE_PCT, FLAG, DRIVER_HINTS]
+      - { entity_property: id, table_column: CHANNEL }
+    columns: [MASTER_STORE_ID, STORE_NAME, CHANNEL, WEEK_END, DAYS_CUR, SALES_CUR, SALES_PREV, SALES_BASE, ORDERS_CUR, ORDERS_PREV, ORDERS_BASE, AOV_CUR, AOV_PREV, SPEND_DAY_CUR, SPEND_DAY_PREV, ROI_CUR, ROI_PREV, IMPR_DAY_CUR, IMPR_DAY_PREV, M2O_CUR, M2O_PREV, MKT_DAYS_CUR, MKT_WEEK_END, COMPLAINTS_CUR, COMPLAINTS_PREV, REVIEWS_CUR, RATING_CUR, RAIN_DAYS_CUR, RAIN_DAYS_PREV, OCCASIONS_CUR, OCCASIONS_PREV]
+
+  - entity_type: Store
+    name: Sales gap - Zomato marketing funnel
+    description: Full Zomato ad funnel per Zomato store plus an 'All stores' row, latest
+      marketing week vs the week before, per loaded day. Spend, ad sales, ROI, budget used,
+      ad/total impressions, clicks, menu opens, orders, CTR and M2O. Read by sales_gap_diagnosis.
+    source_table: V_SALES_GAP_ZOMATO_MKT
+    connection: live_bq
+    cardinality: "1:m"
+    match:
+      - { entity_property: id, table_column: MKT_WEEK_END }
+    columns: [MASTER_STORE_ID, STORE_NAME, MKT_WEEK_END, MKT_DAYS_CUR, MKT_DAYS_PREV, SPEND_DAY_CUR, SPEND_DAY_PREV, AD_SALES_DAY_CUR, AD_SALES_DAY_PREV, ROI_CUR, ROI_PREV, BUDGET_USED_CUR, BUDGET_USED_PREV, AD_IMPR_DAY_CUR, AD_IMPR_DAY_PREV, AD_CLICKS_DAY_CUR, AD_CLICKS_DAY_PREV, AD_ORD_DAY_CUR, AD_ORD_DAY_PREV, ADS_CTR_CUR, ADS_CTR_PREV, ADS_M2O_CUR, ADS_M2O_PREV, IMPR_DAY_CUR, IMPR_DAY_PREV, OPENS_DAY_CUR, OPENS_DAY_PREV, ORD_DAY_CUR, ORD_DAY_PREV, CTR_CUR, CTR_PREV, M2O_CUR, M2O_PREV]
 
   # --- attached to Product ----------------------------------------------
   # Static product truth (1:1 on SKU) from the PIM dataset, not bronze — hence
@@ -222,6 +233,20 @@ datasets:
     join_keys:
       - { entity_attribute: id, table_column: SKU }
     columns: [SKU, DISPLAY_NAME, MRP_INR, TOTAL_COGS_INR, SHELF_LIFE_DAYS]
+
+  # Sales-gap diagnosis, product grain (sql/views.sql V_SALES_GAP_PRODUCT). `match:` on
+  # WEEK_END so it mints no Product entities; read cross-type by sales_gap_diagnosis.
+  - entity_type: Product
+    name: Sales gap - product
+    description: Latest sales week vs the prior week and the 4-week baseline per product across all
+      stores and channels. Raw sales and units, plus complaints matched to the product through the
+      order id. Unmapped items (hampers, gift boxes) have SKU_ID 'UNKNOWN'. Read by sales_gap_diagnosis.
+    source_table: V_SALES_GAP_PRODUCT
+    connection: live_bq
+    cardinality: "1:m"
+    match:
+      - { entity_property: id, table_column: WEEK_END }
+    columns: [SKU_ID, ITEM_NAME, WEEK_END, DAYS_CUR, SALES_CUR, SALES_PREV, SALES_BASE, UNITS_CUR, UNITS_PREV, UNITS_BASE, COMPLAINTS_CUR, COMPLAINTS_PREV]
 
   # --- attached to CustomerSegment --------------------------------------
   - entity_type: CustomerSegment
