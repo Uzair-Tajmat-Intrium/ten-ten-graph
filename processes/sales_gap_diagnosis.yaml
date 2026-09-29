@@ -161,6 +161,7 @@ processes:
         - SALES_CUR
         - SALES_BASE
         - VS_BASE_PCT
+        - LY_VS_BASE_PCT
         - WOW_PCT
         - ORDERS_CHG_PCT
         - AOV_CHG_PCT
@@ -208,6 +209,7 @@ processes:
             - SALES_CUR
             - SALES_BASE
             - VS_BASE_PCT
+            - LY_VS_BASE_PCT
             - ORDERS_CHG_PCT
             - AOV_CHG_PCT
             - DRIVER_HINTS
@@ -321,6 +323,7 @@ processes:
           - SALES_CUR
           - SALES_BASE
           - VS_BASE_PCT
+          - LY_VS_BASE_PCT
           - WOW_PCT
           - ORDERS_CHG_PCT
           - AOV_CHG_PCT
@@ -355,6 +358,7 @@ processes:
           - SALES_CUR
           - SALES_BASE
           - VS_BASE_PCT
+          - LY_VS_BASE_PCT
           - WOW_PCT
           - ORDERS_CHG_PCT
           - AOV_CHG_PCT

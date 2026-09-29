@@ -1286,6 +1286,8 @@ JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_CHANNEL` c USING (CH
 -- PREV and BASE keep only the weekdays that have sales in CUR, and all comparisons are
 -- daily rates over those loaded days (the load has whole-day gaps). DAYS_CUR says how
 -- many of the 7 days actually loaded; SALES_BASE is scaled to DAYS_CUR days.
+--   LAST YEAR = the same 5 weeks one year earlier (anchor - 364 days, same weekdays), for
+--   LY_VS_BASE_PCT: did the same move happen last year? Evidence only, not the flag.
 --
 -- Data traps handled (see semantic_models/ten_ten_semantic_model.osi.yaml):
 --   * BUSINESS_ANALYTICS is order-LINE grain but TOTAL/NET/DISCOUNT are ORDER-level values
@@ -1361,7 +1363,7 @@ coverage AS (
   FROM lines
 ),
 -- The same lines keyed three ways, so ONE aggregation serves all three levels.
--- Unmapped items all carry SKU_ID = 'UNKNOWN' (14 different items in Aug-Sep 2026), so at
+-- Unmapped items carry SKU_ID = 'UNKNOWN' (2026) or 'UNMAPPED' (2025), many items each, so at
 -- PRODUCT level they are keyed by item name instead of being lumped into one fake SKU.
 keyed AS (
   SELECT 'STORE'   AS LEVEL, STORE_ID AS K_STORE, CH    AS K_CH, 'ALL'  AS K_SKU, l.* FROM lines l
@@ -1369,7 +1371,7 @@ keyed AS (
   SELECT 'CHANNEL' AS LEVEL, 'ALL'    AS K_STORE, CH    AS K_CH, 'ALL'  AS K_SKU, l.* FROM lines l
   UNION ALL
   SELECT 'PRODUCT' AS LEVEL, 'ALL'    AS K_STORE, 'ALL' AS K_CH,
-         IF(SKU_ID IS NULL OR SKU_ID IN ('', 'UNKNOWN'), CONCAT('UNMAPPED:', ITEM_SOURCE_NAME), SKU_ID) AS K_SKU,
+         IF(SKU_ID IS NULL OR SKU_ID IN ('', 'UNKNOWN', 'UNMAPPED'), CONCAT('UNMAPPED:', ITEM_SOURCE_NAME), SKU_ID) AS K_SKU,
          l.* FROM lines l
 ),
 sales AS (
@@ -1385,6 +1387,57 @@ sales AS (
     SUM(IF(IS_CUR  AND NOT IS_CANCELLED, QUANTITY, 0))                                 AS UNITS_CUR
   FROM keyed
   GROUP BY LEVEL, K_STORE, K_CH, K_SKU
+),
+-- ---------------------------------------------------------------- same weeks last year
+-- The SAME 5 weeks one year earlier (anchor - 364 days, so weekdays line up), with the
+-- same weekday matching, keys and daily-rate maths. LY_VS_BASE_PCT = how last year's
+-- "this week" compared with last year's own 4-week baseline. It is EVIDENCE only (the
+-- FLAG still comes from this year): a dip that also happened last year is seasonal.
+-- Caveats: one prior year only; items/stores that did not sell then get NULL; reused
+-- store ids (100010, 100012, 100025) may compare against the previous store at that id.
+ly_lines AS (
+  SELECT
+    b.STORE_ID,
+    b.SKU_ID,
+    b.ITEM_SOURCE_NAME,
+    CASE
+      WHEN STRPOS(LOWER(b.CHANNEL), 'zomato') > 0 THEN 'Zomato'
+      WHEN STRPOS(LOWER(b.CHANNEL), 'swiggy') > 0 THEN 'Swiggy'
+      ELSE 'Other'
+    END                                                        AS CH,
+    CAST(b.UNIT_PRICE * b.QUANTITY AS FLOAT64)                 AS LINE_VALUE,
+    b.ORDER_DATE,
+    b.ORDER_DATE >= DATE_SUB(a.A, INTERVAL 364 + 6 DAY)        AS IS_CUR,
+    b.ORDER_DATE <= DATE_SUB(a.A, INTERVAL 364 + 7 DAY)        AS IS_BASE
+  FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS` b
+  CROSS JOIN anchor a
+  JOIN cur_dows cd ON cd.DOW = EXTRACT(DAYOFWEEK FROM b.ORDER_DATE)
+  WHERE b.ORDER_DATE BETWEEN DATE_SUB(a.A, INTERVAL 364 + 34 DAY) AND DATE_SUB(a.A, INTERVAL 364 DAY)
+    AND b.ORDER_STATE <> 'Cancelled'
+),
+ly_coverage AS (
+  SELECT
+    COUNT(DISTINCT IF(IS_CUR,  ORDER_DATE, NULL)) AS LY_DAYS_CUR,
+    COUNT(DISTINCT IF(IS_BASE, ORDER_DATE, NULL)) AS LY_DAYS_BASE
+  FROM ly_lines
+),
+ly_keyed AS (
+  SELECT 'STORE'   AS LEVEL, STORE_ID AS K_STORE, CH    AS K_CH, 'ALL'  AS K_SKU, l.* FROM ly_lines l
+  UNION ALL
+  SELECT 'CHANNEL' AS LEVEL, 'ALL'    AS K_STORE, CH    AS K_CH, 'ALL'  AS K_SKU, l.* FROM ly_lines l
+  UNION ALL
+  SELECT 'PRODUCT' AS LEVEL, 'ALL'    AS K_STORE, 'ALL' AS K_CH,
+         IF(SKU_ID IS NULL OR SKU_ID IN ('', 'UNKNOWN', 'UNMAPPED'), CONCAT('UNMAPPED:', ITEM_SOURCE_NAME), SKU_ID) AS K_SKU,
+         l.* FROM ly_lines l
+),
+ly_sales AS (
+  SELECT
+    k.LEVEL, k.K_STORE, k.K_CH, k.K_SKU,
+    SAFE_DIVIDE(SUM(IF(k.IS_CUR,  k.LINE_VALUE, 0)), ANY_VALUE(c.LY_DAYS_CUR))  AS LY_CUR_RATE,
+    SAFE_DIVIDE(SUM(IF(k.IS_BASE, k.LINE_VALUE, 0)), ANY_VALUE(c.LY_DAYS_BASE)) AS LY_BASE_RATE
+  FROM ly_keyed k
+  CROSS JOIN ly_coverage c
+  GROUP BY k.LEVEL, k.K_STORE, k.K_CH, k.K_SKU
 ),
 -- ---------------------------------------------------------------- drivers
 -- Marketing lags sales and has its OWN whole-day gaps (it stopped at 21 Sep, then had no
@@ -1526,7 +1579,9 @@ joined AS (
     cv.DAYS_PREV,
     cv.DAYS_BASE,
     mka_d.MA AS MKT_WEEK_END,
-    mc.MKT_DAYS_CUR
+    mc.MKT_DAYS_CUR,
+    ly.LY_CUR_RATE,
+    ly.LY_BASE_RATE
   FROM sales s
   LEFT JOIN `gen-lang-client-0520145261.bronze.MASTER_STORE` ms
     ON s.LEVEL = 'STORE' AND ms.MASTER_STORE_ID = s.K_STORE
@@ -1546,6 +1601,8 @@ joined AS (
     ON s.LEVEL = 'STORE' AND lss.MASTER_STORE_ID = s.K_STORE
   LEFT JOIN low_stock_sku lsk
     ON s.LEVEL = 'PRODUCT' AND lsk.SKU_ID = s.K_SKU
+  LEFT JOIN ly_sales ly
+    ON ly.LEVEL = s.LEVEL AND ly.K_STORE = s.K_STORE AND ly.K_CH = s.K_CH AND ly.K_SKU = s.K_SKU
   CROSS JOIN occasions o
   CROSS JOIN coverage cv
   CROSS JOIN mkt_anchor mka_d
@@ -1573,6 +1630,10 @@ scored AS (
     ROUND(SAFE_DIVIDE(j.AOV_CUR - j.AOV_PREV, NULLIF(j.AOV_PREV, 0)) * 100, 1)       AS AOV_CHG_PCT,
     ROUND(SAFE_DIVIDE(j.AD_SPEND_CUR - j.AD_SPEND_PREV, NULLIF(j.AD_SPEND_PREV, 0)) * 100, 0) AS AD_SPEND_CHG_PCT,
     ROUND(SAFE_DIVIDE(j.IMPR_CUR - j.IMPR_PREV, NULLIF(j.IMPR_PREV, 0)) * 100, 0)     AS IMPRESSIONS_CHG_PCT,
+    -- Only when last year's baseline was big enough to mean something (half this year's floor).
+    IF(j.LY_BASE_RATE * 7 >= IF(j.LEVEL = 'PRODUCT', 1000, 2500),
+       ROUND(SAFE_DIVIDE(j.LY_CUR_RATE - j.LY_BASE_RATE, NULLIF(j.LY_BASE_RATE, 0)) * 100, 1),
+       NULL)                                                                         AS LY_VS_BASE_PCT,
     IF(j.LEVEL = 'PRODUCT', 2000, 5000)                                              AS MIN_BASE
   FROM rated j
 )
@@ -1611,6 +1672,7 @@ SELECT
   OCCASIONS_CUR,
   MKT_WEEK_END,
   MKT_DAYS_CUR,
+  LY_VS_BASE_PCT,
   CASE
     WHEN SALES_BASE >= MIN_BASE AND VS_BASE_PCT <= -20 THEN 'DROP'
     WHEN SALES_BASE >= MIN_BASE AND VS_BASE_PCT >=  20 THEN 'SPIKE'
@@ -1622,6 +1684,7 @@ SELECT
   COALESCE(NULLIF(ARRAY_TO_STRING([
     IF(LEVEL = 'PRODUCT' AND SALES_CUR = 0 AND SALES_PREV = 0, 'no sales for 2 weeks (seasonal or delisted item)', NULL),
     IF(ABS(ORDERS_CHG_PCT) >= 15, FORMAT('orders %+.0f%%', ORDERS_CHG_PCT), NULL),
+    IF(LY_VS_BASE_PCT IS NOT NULL, FORMAT('same wk last yr %+.0f%%', LY_VS_BASE_PCT), 'no last-yr history'),
     IF(ABS(AOV_CHG_PCT)    >= 15, FORMAT('AOV %+.0f%% (Rs%.0f vs %.0f)', AOV_CHG_PCT, AOV_CUR, AOV_PREV), NULL),
     CASE
       WHEN AD_SPEND_CUR IS NULL                      THEN NULL
