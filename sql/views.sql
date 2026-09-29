@@ -1266,3 +1266,365 @@ SELECT
   m.PRIMARY_SALES_OWNER
 FROM `gen-lang-client-0520145261.ctx_upside_master_data.MAP_PRODUCT_CHANNEL` m
 JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_CHANNEL` c USING (CHANNEL_ID);
+
+-- Sales-gap diagnosis (processes.yaml: sales_gap_diagnosis).
+--
+-- ONE view does all the arithmetic, because a process step sees ~9000 chars and every
+-- other fact is cut to 4 rows: the process only reads the rows flagged here and lets
+-- the agent explain them.
+--
+-- Grain: one row per LEVEL key, behind a LEVEL discriminator —
+--   STORE    store x channel          (MASTER_STORE_ID, CHANNEL)
+--   CHANNEL  channel, all stores      (MASTER_STORE_ID = 'ALL')
+--   PRODUCT  SKU, all stores/channels (MASTER_STORE_ID = 'ALL', CHANNEL = 'ALL')
+--
+-- Windows are anchored on MAX(ORDER_DATE), NOT CURRENT_DATE(): the Petpooja load runs a
+-- day behind, so a CURRENT_DATE() week would always look like a dip.
+--   CUR  = anchor-6  .. anchor     (latest 7 days)
+--   PREV = anchor-13 .. anchor-7   (the 7 days before)
+--   BASE = anchor-34 .. anchor-7   (the 4 weeks before CUR)
+-- PREV and BASE keep only the weekdays that have sales in CUR, and all comparisons are
+-- daily rates over those loaded days (the load has whole-day gaps). DAYS_CUR says how
+-- many of the 7 days actually loaded; SALES_BASE is scaled to DAYS_CUR days.
+--
+-- Data traps handled (see semantic_models/ten_ten_semantic_model.osi.yaml):
+--   * BUSINESS_ANALYTICS is order-LINE grain but TOTAL/NET/DISCOUNT are ORDER-level values
+--     repeated per line, so sales = UNIT_PRICE * QUANTITY, never SUM(TOTAL).
+--   * Orders are COUNT(DISTINCT ORDER_ID); ONLINE_ORDER_ID is blank on most rows.
+--   * CHANNEL is mixed case with store variants -> normalised to Zomato / Swiggy / Other.
+--   * Complaints are counted by ORDER_ID (EVENT_ID is mostly null); reviews de-duplicated
+--     on REVIEW_ID; weather counted on DISTINCT WEATHER_DATE (duplicate store x day rows).
+--   * RAW_MARKETING_DATA is Zomato-only; RES_ID (STRING) -> STORE_CHANNEL_MAPPING.ZOMATO_ID
+--     (INT64). TOTAL_IMPRESSIONS is the restaurant's whole day, repeated per campaign row,
+--     so it is MAX'd per (RES_ID, DATE) before summing.
+--   * Store ids were reused (100010 Juhu->Fort, 100012 Malabar->Khar, 100025
+--     Borivali->Dahisar). A rename inside the 5-week window will show as a false gap;
+--     STORE_NAME is the current MASTER_STORE name.
+--
+-- Not in the data yet (the agent is told to say so): cancellations (silver.BUSINESS_ANALYTICS
+-- carries no 'Cancelled' rows; they live only in RAW_PETPOOJA_TRANSACTIONS), KPT, store online availability,
+-- Swiggy marketing, competitor prices. Swiggy menu availability exists but is keyed by
+-- delivery-location text, not store id, so it is left out of v1.
+--
+-- FLAG = DROP / SPIKE when sales moved >= 20% vs the 4-week baseline AND the baseline is
+-- big enough to matter (Rs 5,000/week for STORE and CHANNEL rows, Rs 2,000 for PRODUCT);
+-- NORMAL otherwise. DRIVER_HINTS packs the likely drivers into one readable string.
+
+CREATE OR REPLACE VIEW `gen-lang-client-0520145261.bronze.V_SALES_GAP_SIGNALS` AS
+WITH anchor AS (
+  SELECT MAX(ORDER_DATE) AS A
+  FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS`
+),
+-- Weekdays that have ANY sales in the current week. The load has whole-day gaps (e.g.
+-- no rows at all for Wed 23 / Thu 24 Sep 2026); PREV and BASE are restricted to the SAME
+-- weekdays so a missing midweek day neither fakes a dip nor lets a weekend-heavy week
+-- fake a spike. Windows are then compared on daily rates over those matched days.
+cur_dows AS (
+  SELECT DISTINCT EXTRACT(DAYOFWEEK FROM b.ORDER_DATE) AS DOW
+  FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS` b
+  CROSS JOIN anchor a
+  WHERE b.ORDER_DATE BETWEEN DATE_SUB(a.A, INTERVAL 6 DAY) AND a.A
+),
+lines AS (
+  SELECT
+    b.STORE_ID,
+    b.SKU_ID,
+    b.ORDER_ID,
+    b.ITEM_SOURCE_NAME,
+    CASE
+      WHEN STRPOS(LOWER(b.CHANNEL), 'zomato') > 0 THEN 'Zomato'
+      WHEN STRPOS(LOWER(b.CHANNEL), 'swiggy') > 0 THEN 'Swiggy'
+      ELSE 'Other'
+    END                                                        AS CH,
+    b.ORDER_STATE = 'Cancelled'                                AS IS_CANCELLED,
+    CAST(b.UNIT_PRICE * b.QUANTITY AS FLOAT64)                 AS LINE_VALUE,
+    b.QUANTITY,
+    b.ORDER_DATE,
+    b.ORDER_DATE >= DATE_SUB(a.A, INTERVAL 6 DAY)              AS IS_CUR,
+    cd.DOW IS NOT NULL
+      AND b.ORDER_DATE BETWEEN DATE_SUB(a.A, INTERVAL 13 DAY)
+                           AND DATE_SUB(a.A, INTERVAL 7 DAY)   AS IS_PREV,
+    cd.DOW IS NOT NULL
+      AND b.ORDER_DATE BETWEEN DATE_SUB(a.A, INTERVAL 34 DAY)
+                           AND DATE_SUB(a.A, INTERVAL 7 DAY)   AS IS_BASE
+  FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS` b
+  CROSS JOIN anchor a
+  LEFT JOIN cur_dows cd ON cd.DOW = EXTRACT(DAYOFWEEK FROM b.ORDER_DATE)
+  WHERE b.ORDER_DATE BETWEEN DATE_SUB(a.A, INTERVAL 34 DAY) AND a.A
+),
+-- Loaded (weekday-matched) days per window, network-wide: the daily-rate denominators.
+coverage AS (
+  SELECT
+    COUNT(DISTINCT IF(IS_CUR,  ORDER_DATE, NULL)) AS DAYS_CUR,
+    COUNT(DISTINCT IF(IS_PREV, ORDER_DATE, NULL)) AS DAYS_PREV,
+    COUNT(DISTINCT IF(IS_BASE, ORDER_DATE, NULL)) AS DAYS_BASE
+  FROM lines
+),
+-- The same lines keyed three ways, so ONE aggregation serves all three levels.
+-- Unmapped items all carry SKU_ID = 'UNKNOWN' (14 different items in Aug-Sep 2026), so at
+-- PRODUCT level they are keyed by item name instead of being lumped into one fake SKU.
+keyed AS (
+  SELECT 'STORE'   AS LEVEL, STORE_ID AS K_STORE, CH    AS K_CH, 'ALL'  AS K_SKU, l.* FROM lines l
+  UNION ALL
+  SELECT 'CHANNEL' AS LEVEL, 'ALL'    AS K_STORE, CH    AS K_CH, 'ALL'  AS K_SKU, l.* FROM lines l
+  UNION ALL
+  SELECT 'PRODUCT' AS LEVEL, 'ALL'    AS K_STORE, 'ALL' AS K_CH,
+         IF(SKU_ID IS NULL OR SKU_ID IN ('', 'UNKNOWN'), CONCAT('UNMAPPED:', ITEM_SOURCE_NAME), SKU_ID) AS K_SKU,
+         l.* FROM lines l
+),
+sales AS (
+  SELECT
+    LEVEL, K_STORE, K_CH, K_SKU,
+    ANY_VALUE(ITEM_SOURCE_NAME)                                                        AS SRC_ITEM_NAME,
+    SUM(IF(IS_CUR  AND NOT IS_CANCELLED, LINE_VALUE, 0))                               AS SALES_CUR,
+    SUM(IF(IS_PREV AND NOT IS_CANCELLED, LINE_VALUE, 0))                               AS SALES_PREV,
+    SUM(IF(IS_BASE AND NOT IS_CANCELLED, LINE_VALUE, 0))                               AS SALES_BASE_TOTAL,
+    COUNT(DISTINCT IF(IS_CUR  AND NOT IS_CANCELLED, ORDER_ID, NULL))                   AS ORDERS_CUR,
+    COUNT(DISTINCT IF(IS_PREV AND NOT IS_CANCELLED, ORDER_ID, NULL))                   AS ORDERS_PREV,
+    COUNT(DISTINCT IF(IS_BASE AND NOT IS_CANCELLED, ORDER_ID, NULL))                   AS ORDERS_BASE_TOTAL,
+    SUM(IF(IS_CUR  AND NOT IS_CANCELLED, QUANTITY, 0))                                 AS UNITS_CUR
+  FROM keyed
+  GROUP BY LEVEL, K_STORE, K_CH, K_SKU
+),
+-- ---------------------------------------------------------------- drivers
+-- Marketing lags sales by several days (it ended 21 Sep while sales ran to 27 Sep), so
+-- it gets its OWN anchor: its latest 7 loaded days vs the 7 before. Anchoring it on the
+-- sales week would compare a part-empty week and fake an ~86% spend cut.
+mkt_anchor AS (
+  SELECT MAX(DATE) AS MA FROM `gen-lang-client-0520145261.bronze.RAW_MARKETING_DATA`
+),
+mkt_daily AS (
+  -- Zomato only. Ad spend sums over campaign rows; the restaurant funnel is per day.
+  SELECT
+    m.RES_ID,
+    m.DATE,
+    SUM(m.AD_SPEND_RS)        AS SPEND,
+    MAX(m.TOTAL_IMPRESSIONS)  AS IMPR
+  FROM `gen-lang-client-0520145261.bronze.RAW_MARKETING_DATA` m
+  CROSS JOIN mkt_anchor ma
+  WHERE m.DATE BETWEEN DATE_SUB(ma.MA, INTERVAL 13 DAY) AND ma.MA
+  GROUP BY 1, 2
+),
+mkt_store AS (
+  SELECT
+    scm.MASTER_STORE_ID,
+    SUM(IF(d.DATE >= DATE_SUB(ma.MA, INTERVAL 6 DAY), d.SPEND, 0)) AS AD_SPEND_CUR,
+    SUM(IF(d.DATE <  DATE_SUB(ma.MA, INTERVAL 6 DAY), d.SPEND, 0)) AS AD_SPEND_PREV,
+    SUM(IF(d.DATE >= DATE_SUB(ma.MA, INTERVAL 6 DAY), d.IMPR,  0)) AS IMPR_CUR,
+    SUM(IF(d.DATE <  DATE_SUB(ma.MA, INTERVAL 6 DAY), d.IMPR,  0)) AS IMPR_PREV
+  FROM mkt_daily d
+  JOIN `gen-lang-client-0520145261.bronze.STORE_CHANNEL_MAPPING` scm
+    ON scm.ZOMATO_ID = SAFE_CAST(d.RES_ID AS INT64)
+  CROSS JOIN mkt_anchor ma
+  GROUP BY 1
+),
+mkt_all AS (
+  SELECT 'ALL' AS MASTER_STORE_ID,
+         SUM(AD_SPEND_CUR) AS AD_SPEND_CUR, SUM(AD_SPEND_PREV) AS AD_SPEND_PREV,
+         SUM(IMPR_CUR) AS IMPR_CUR, SUM(IMPR_PREV) AS IMPR_PREV
+  FROM mkt_store
+),
+complaints AS (
+  SELECT
+    c.MASTER_STORE_ID,
+    CASE
+      WHEN STRPOS(LOWER(c.SOURCE_SYSTEM), 'zomato') > 0 THEN 'Zomato'
+      WHEN STRPOS(LOWER(c.SOURCE_SYSTEM), 'swiggy') > 0 THEN 'Swiggy'
+      ELSE 'Other'
+    END AS CH,
+    COUNT(DISTINCT IF(DATE(c.COMPLAINT_RECEIVED_AT) >= DATE_SUB(a.A, INTERVAL 6 DAY), c.ORDER_ID, NULL)) AS COMPLAINTS_CUR,
+    COUNT(DISTINCT IF(DATE(c.COMPLAINT_RECEIVED_AT) <  DATE_SUB(a.A, INTERVAL 6 DAY), c.ORDER_ID, NULL)) AS COMPLAINTS_PREV
+  FROM `gen-lang-client-0520145261.bronze.CUSTOMER_COMPLAINT_EVENTS` c
+  CROSS JOIN anchor a
+  WHERE DATE(c.COMPLAINT_RECEIVED_AT) BETWEEN DATE_SUB(a.A, INTERVAL 13 DAY) AND a.A
+  GROUP BY 1, 2
+),
+reviews AS (
+  SELECT
+    r.MASTER_STORE_ID,
+    CASE
+      WHEN STRPOS(LOWER(r.SOURCE_SYSTEM), 'zomato') > 0 THEN 'Zomato'
+      WHEN STRPOS(LOWER(r.SOURCE_SYSTEM), 'swiggy') > 0 THEN 'Swiggy'
+      ELSE 'Other'
+    END                                   AS CH,
+    COUNT(*)                              AS REVIEWS_CUR,
+    ROUND(AVG(r.STAR_RATING), 1)          AS AVG_RATING_CUR
+  FROM (
+    SELECT DISTINCT REVIEW_ID, MASTER_STORE_ID, SOURCE_SYSTEM,
+           CAST(STAR_RATING AS FLOAT64) AS STAR_RATING, DATE(REVIEW_DATE) AS REVIEW_DAY
+    FROM `gen-lang-client-0520145261.bronze.CUSTOMER_REVIEW_EVENTS`
+  ) r
+  CROSS JOIN anchor a
+  WHERE r.REVIEW_DAY BETWEEN DATE_SUB(a.A, INTERVAL 6 DAY) AND a.A
+  GROUP BY 1, 2
+),
+weather AS (
+  SELECT
+    w.MASTER_STORE_ID,
+    COUNT(DISTINCT IF(w.IS_RAINY AND w.WEATHER_DATE >= DATE_SUB(a.A, INTERVAL 6 DAY), w.WEATHER_DATE, NULL)) AS RAINY_DAYS_CUR,
+    COUNT(DISTINCT IF(w.IS_RAINY AND w.WEATHER_DATE <  DATE_SUB(a.A, INTERVAL 6 DAY), w.WEATHER_DATE, NULL)) AS RAINY_DAYS_PREV
+  FROM `gen-lang-client-0520145261.bronze.WEATHER_DATA_PAST` w
+  CROSS JOIN anchor a
+  WHERE w.WEATHER_DATE BETWEEN DATE_SUB(a.A, INTERVAL 13 DAY) AND a.A
+  GROUP BY 1
+),
+low_stock AS (
+  -- Latest report only; flags are the strings 'YES' / 'NO'.
+  SELECT MASTER_STORE_ID, SKU_ID
+  FROM `gen-lang-client-0520145261.bronze.FLAGGED_INVENTORY`
+  WHERE LOW_STOCK_FLAG = 'YES'
+    AND REPORT_DATE = (SELECT MAX(REPORT_DATE) FROM `gen-lang-client-0520145261.bronze.FLAGGED_INVENTORY`)
+),
+low_stock_store AS (
+  SELECT MASTER_STORE_ID, COUNT(DISTINCT SKU_ID) AS LOW_STOCK_SKUS FROM low_stock GROUP BY 1
+),
+low_stock_sku AS (
+  SELECT SKU_ID, COUNT(DISTINCT MASTER_STORE_ID) AS LOW_STOCK_STORES FROM low_stock GROUP BY 1
+),
+occasions AS (
+  SELECT
+    STRING_AGG(DISTINCT IF(c.DATE_KEY >= DATE_SUB(a.A, INTERVAL 6 DAY), c.HOLIDAY_NAME, NULL), ', ') AS OCCASIONS_CUR,
+    STRING_AGG(DISTINCT IF(c.DATE_KEY <  DATE_SUB(a.A, INTERVAL 6 DAY), c.HOLIDAY_NAME, NULL), ', ') AS OCCASIONS_PREV
+  FROM `gen-lang-client-0520145261.bronze.CALENDAR_DIM` c
+  CROSS JOIN anchor a
+  WHERE c.DATE_KEY BETWEEN DATE_SUB(a.A, INTERVAL 13 DAY) AND a.A
+    AND (c.IS_HOLIDAY OR c.IS_DESSERT_OCCASION OR c.IS_SPECIAL_OCCASION)
+    AND c.HOLIDAY_NAME IS NOT NULL AND TRIM(c.HOLIDAY_NAME) <> ''
+),
+-- ---------------------------------------------------------------- assemble
+joined AS (
+  SELECT
+    s.*,
+    CASE WHEN s.LEVEL = 'STORE' THEN COALESCE(ms.STORE_NAME, s.K_STORE) ELSE 'All stores' END AS STORE_NAME,
+    CASE WHEN s.LEVEL = 'PRODUCT' THEN COALESCE(p.DISPLAY_NAME, s.SRC_ITEM_NAME, s.K_SKU) ELSE '' END AS ITEM_NAME,
+    ROUND(SAFE_DIVIDE(s.SALES_CUR,  NULLIF(s.ORDERS_CUR, 0)), 0)  AS AOV_CUR,
+    ROUND(SAFE_DIVIDE(s.SALES_PREV, NULLIF(s.ORDERS_PREV, 0)), 0) AS AOV_PREV,
+    -- Marketing only applies to Zomato rows (Swiggy ads are not integrated).
+    IF(s.K_CH = 'Zomato', COALESCE(mk.AD_SPEND_CUR,  mka.AD_SPEND_CUR),  NULL) AS AD_SPEND_CUR,
+    IF(s.K_CH = 'Zomato', COALESCE(mk.AD_SPEND_PREV, mka.AD_SPEND_PREV), NULL) AS AD_SPEND_PREV,
+    IF(s.K_CH = 'Zomato', COALESCE(mk.IMPR_CUR,      mka.IMPR_CUR),      NULL) AS IMPR_CUR,
+    IF(s.K_CH = 'Zomato', COALESCE(mk.IMPR_PREV,     mka.IMPR_PREV),     NULL) AS IMPR_PREV,
+    COALESCE(cp.COMPLAINTS_CUR, 0)  AS COMPLAINTS_CUR,
+    COALESCE(cp.COMPLAINTS_PREV, 0) AS COMPLAINTS_PREV,
+    rv.REVIEWS_CUR,
+    rv.AVG_RATING_CUR,
+    COALESCE(w.RAINY_DAYS_CUR, 0)   AS RAINY_DAYS_CUR,
+    COALESCE(w.RAINY_DAYS_PREV, 0)  AS RAINY_DAYS_PREV,
+    COALESCE(lss.LOW_STOCK_SKUS, 0)   AS LOW_STOCK_SKUS,
+    COALESCE(lsk.LOW_STOCK_STORES, 0) AS LOW_STOCK_STORES,
+    o.OCCASIONS_CUR,
+    o.OCCASIONS_PREV,
+    cv.DAYS_CUR,
+    cv.DAYS_PREV,
+    cv.DAYS_BASE,
+    mka_d.MA AS MKT_WEEK_END
+  FROM sales s
+  LEFT JOIN `gen-lang-client-0520145261.bronze.MASTER_STORE` ms
+    ON s.LEVEL = 'STORE' AND ms.MASTER_STORE_ID = s.K_STORE
+  LEFT JOIN `gen-lang-client-0520145261.ctx_upside_master_data.DIM_PRODUCT` p
+    ON s.LEVEL = 'PRODUCT' AND p.SKU = s.K_SKU
+  LEFT JOIN mkt_store mk
+    ON s.LEVEL = 'STORE' AND mk.MASTER_STORE_ID = s.K_STORE
+  LEFT JOIN mkt_all mka
+    ON s.LEVEL = 'CHANNEL'
+  LEFT JOIN complaints cp
+    ON s.LEVEL = 'STORE' AND cp.MASTER_STORE_ID = s.K_STORE AND cp.CH = s.K_CH
+  LEFT JOIN reviews rv
+    ON s.LEVEL = 'STORE' AND rv.MASTER_STORE_ID = s.K_STORE AND rv.CH = s.K_CH
+  LEFT JOIN weather w
+    ON s.LEVEL = 'STORE' AND w.MASTER_STORE_ID = s.K_STORE
+  LEFT JOIN low_stock_store lss
+    ON s.LEVEL = 'STORE' AND lss.MASTER_STORE_ID = s.K_STORE
+  LEFT JOIN low_stock_sku lsk
+    ON s.LEVEL = 'PRODUCT' AND lsk.SKU_ID = s.K_SKU
+  CROSS JOIN occasions o
+  CROSS JOIN coverage cv
+  CROSS JOIN mkt_anchor mka_d
+),
+rated AS (
+  SELECT
+    j.*,
+    SAFE_DIVIDE(j.SALES_CUR,         j.DAYS_CUR)  AS CUR_RATE,
+    SAFE_DIVIDE(j.SALES_PREV,        j.DAYS_PREV) AS PREV_RATE,
+    SAFE_DIVIDE(j.SALES_BASE_TOTAL,  j.DAYS_BASE) AS BASE_RATE,
+    SAFE_DIVIDE(j.ORDERS_CUR,        j.DAYS_CUR)  AS ORD_CUR_RATE,
+    SAFE_DIVIDE(j.ORDERS_BASE_TOTAL, j.DAYS_BASE) AS ORD_BASE_RATE
+  FROM joined j
+),
+scored AS (
+  SELECT
+    j.*,
+    -- Baseline scaled to the SAME number of loaded days as SALES_CUR, so the two read
+    -- side by side (with a full week this is the plain 4-week weekly average).
+    j.BASE_RATE * j.DAYS_CUR                                                          AS SALES_BASE,
+    ROUND(SAFE_DIVIDE(j.CUR_RATE - j.PREV_RATE, NULLIF(j.PREV_RATE, 0)) * 100, 1)     AS WOW_PCT,
+    ROUND(SAFE_DIVIDE(j.CUR_RATE - j.BASE_RATE, NULLIF(j.BASE_RATE, 0)) * 100, 1)     AS VS_BASE_PCT,
+    ROUND(SAFE_DIVIDE(j.ORD_CUR_RATE - j.ORD_BASE_RATE, NULLIF(j.ORD_BASE_RATE, 0)) * 100, 1) AS ORDERS_CHG_PCT,
+    ROUND(SAFE_DIVIDE(j.AOV_CUR - j.AOV_PREV, NULLIF(j.AOV_PREV, 0)) * 100, 1)       AS AOV_CHG_PCT,
+    ROUND(SAFE_DIVIDE(j.AD_SPEND_CUR - j.AD_SPEND_PREV, NULLIF(j.AD_SPEND_PREV, 0)) * 100, 0) AS AD_SPEND_CHG_PCT,
+    ROUND(SAFE_DIVIDE(j.IMPR_CUR - j.IMPR_PREV, NULLIF(j.IMPR_PREV, 0)) * 100, 0)     AS IMPRESSIONS_CHG_PCT,
+    IF(j.LEVEL = 'PRODUCT', 2000, 5000)                                              AS MIN_BASE
+  FROM rated j
+)
+SELECT
+  LEVEL,
+  K_STORE                                  AS MASTER_STORE_ID,
+  STORE_NAME,
+  IF(K_CH = 'ALL', 'All channels', K_CH)   AS CHANNEL,
+  CASE WHEN K_SKU = 'ALL' THEN ''
+       WHEN STARTS_WITH(K_SKU, 'UNMAPPED:') THEN 'UNKNOWN'
+       ELSE K_SKU END                      AS SKU_ID,
+  ITEM_NAME,
+  (SELECT A FROM anchor)                   AS WEEK_END,
+  DAYS_CUR,
+  ROUND(SALES_CUR, 0)                      AS SALES_CUR,
+  ROUND(SALES_PREV, 0)                     AS SALES_PREV,
+  ROUND(SALES_BASE, 0)                     AS SALES_BASE,
+  WOW_PCT,
+  VS_BASE_PCT,
+  ORDERS_CUR,
+  ORDERS_PREV,
+  ORDERS_CHG_PCT,
+  UNITS_CUR,
+  AOV_CUR,
+  AOV_PREV,
+  AOV_CHG_PCT,
+  ROUND(AD_SPEND_CUR, 0)                   AS AD_SPEND_CUR,
+  ROUND(AD_SPEND_PREV, 0)                  AS AD_SPEND_PREV,
+  IMPRESSIONS_CHG_PCT,
+  COMPLAINTS_CUR,
+  COMPLAINTS_PREV,
+  AVG_RATING_CUR,
+  RAINY_DAYS_CUR,
+  LOW_STOCK_SKUS,
+  LOW_STOCK_STORES,
+  OCCASIONS_CUR,
+  MKT_WEEK_END,
+  CASE
+    WHEN SALES_BASE >= MIN_BASE AND VS_BASE_PCT <= -20 THEN 'DROP'
+    WHEN SALES_BASE >= MIN_BASE AND VS_BASE_PCT >=  20 THEN 'SPIKE'
+    ELSE 'NORMAL'
+  END                                      AS FLAG,
+  -- Marketing (Zomato rows) and rain (STORE rows) are ALWAYS stated, even when flat: a
+  -- missing hint reads to the agent as "no data", not "checked and unchanged".
+  -- Phrases are kept short — the diagnose step reads every flagged row in 9000 chars.
+  COALESCE(NULLIF(ARRAY_TO_STRING([
+    IF(ABS(ORDERS_CHG_PCT) >= 15, FORMAT('orders %+.0f%%', ORDERS_CHG_PCT), NULL),
+    IF(ABS(AOV_CHG_PCT)    >= 15, FORMAT('AOV %+.0f%% (Rs%.0f vs %.0f)', AOV_CHG_PCT, AOV_CUR, AOV_PREV), NULL),
+    CASE
+      WHEN AD_SPEND_CUR IS NULL                      THEN NULL
+      WHEN AD_SPEND_PREV > 0 AND AD_SPEND_CUR = 0    THEN 'Zomato ads stopped'
+      WHEN COALESCE(AD_SPEND_PREV, 0) = 0 AND AD_SPEND_CUR > 0 THEN 'Zomato ads started'
+      WHEN COALESCE(AD_SPEND_PREV, 0) = 0            THEN 'no Zomato ads'
+      ELSE FORMAT('Zomato ads Rs%.0f (%+.0f%%)', AD_SPEND_CUR, AD_SPEND_CHG_PCT)
+    END,
+    IF(IMPRESSIONS_CHG_PCT IS NOT NULL, FORMAT('impressions %+.0f%%', IMPRESSIONS_CHG_PCT), NULL),
+    IF(COMPLAINTS_CUR >= 2 AND COMPLAINTS_CUR > COMPLAINTS_PREV, FORMAT('complaints %d (prev %d)', COMPLAINTS_CUR, COMPLAINTS_PREV), NULL),
+    IF(AVG_RATING_CUR <= 3.5, FORMAT('rating %.1f (%d reviews)', AVG_RATING_CUR, REVIEWS_CUR), NULL),
+    IF(LEVEL = 'STORE', FORMAT('rain %dd (prev %d)', RAINY_DAYS_CUR, RAINY_DAYS_PREV), NULL),
+    IF(LOW_STOCK_SKUS   > 0, FORMAT('low stock %d SKUs', LOW_STOCK_SKUS), NULL),
+    IF(LOW_STOCK_STORES > 0, FORMAT('low stock at %d stores', LOW_STOCK_STORES), NULL),
+    IF(OCCASIONS_CUR  IS NOT NULL, CONCAT('occasion: ', OCCASIONS_CUR), NULL),
+    IF(OCCASIONS_PREV IS NOT NULL, CONCAT('occasion last wk: ', OCCASIONS_PREV), NULL)
+  ], '; '), ''), 'no driver in data')      AS DRIVER_HINTS
+FROM scored;

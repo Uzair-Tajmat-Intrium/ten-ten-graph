@@ -1,0 +1,367 @@
+# Sales Gap Diagnosis: weekly sweep for sales dips and spikes at store x channel,
+# channel and product level, with likely drivers, a review gate and an email on approval.
+# All arithmetic lives in bronze.V_SALES_GAP_SIGNALS (sql/views.sql); the process only
+# reads the flagged rows. Reads use `entity_type` (one cross-store query), not `entity`
+# (one query per Store entity), because the view's CHANNEL / PRODUCT rows carry
+# MASTER_STORE_ID = 'ALL', which is not a real store.
+version: 1
+processes:
+- id: sales_gap_diagnosis
+  name: Sales Gap Diagnosis
+  description: 'Weekly sweep for sales dips and spikes at three levels: store x channel, channel, and
+    product. Each gap comes with the likely reason (Zomato marketing, complaints and ratings, low stock,
+    rain, occasions). On approval, the summary is emailed to the sales, ops and marketing owners.
+
+
+    For the agent: `sales_dips` and `sales_spikes` are ALREADY computed and flagged by the system (bronze.V_SALES_GAP_SIGNALS):
+    the latest sales week vs the prior week and the 4-week baseline, one row per flagged store x channel,
+    channel or product, worst first, each with its evidence in `DRIVER_HINTS`. `gap_counts` gives the
+    number of dips and spikes. Do NOT re-compute or re-filter. Explain the top gaps and say which inputs
+    are not in the data yet.
+
+    '
+  domain: Sales
+  owner: sales_team
+  applies_to:
+  - entity: Store
+  - entity: Store
+    where:
+    - op: ne
+      field: id
+      value: __none__
+  triggers:
+  - type: schedule
+    cron: 0 8 * * 1
+  - type: event
+    event_type: sales_gap_diagnosis
+  - type: manual
+    allowed_roles:
+    - DemandPlanner
+    - SalesManager
+  inputs:
+  - name: store_id
+    type: reference
+    references: Store
+  - name: scheduled_at
+    type: datetime
+  outputs:
+  - name: decision
+    type: enum
+    values:
+    - APPROVE
+    - REJECT
+  - name: sales_dips
+    type: object
+  - name: sales_spikes
+    type: object
+  related_kpis:
+  - DailyGrossSales
+  - DailyOrders
+  - AverageOrderValue
+  - ZomatoROAS
+  - WeeklyComplaints
+  - AvgStoreRating
+  steps:
+  - id: diagnose_gaps
+    name: Diagnose sales gaps
+    type: agent
+    description: Read every flagged dip and spike (already computed in bronze.V_SALES_GAP_SIGNALS) and
+      explain the most important ones with their likely cause.
+    fetch:
+      entity_type: Store
+      source_table: V_SALES_GAP_SIGNALS
+      columns:
+      - LEVEL
+      - STORE_NAME
+      - CHANNEL
+      - ITEM_NAME
+      - VS_BASE_PCT
+      - ORDERS_CHG_PCT
+      - AOV_CHG_PCT
+      - FLAG
+      - DRIVER_HINTS
+      filters:
+        combinator: AND
+        conditions:
+        - column: FLAG
+          op: in
+          value:
+          - DROP
+          - SPIKE
+      order_by: VS_BASE_PCT
+      order_dir: asc
+      limit: 200
+      required: true
+      as: gap_rows
+    instruction: 'Explain why sales moved this week and what to look at first.
+
+      `gap_rows` lists every store/channel/product that moved 20% or more vs its 4-week baseline, with
+      the likely drivers in DRIVER_HINTS. Don''t make anything up. Only cite what''s actually in the data.
+
+      Output top_causes (rank, gap, where, change, cause_type, likely_cause, suggested_action) for the
+      gaps that matter, and a short gap_summary.'
+    produces:
+    - top_causes
+    - gap_summary
+    key_data:
+    - title: Top gaps and likely causes
+      summary: The most important dips and spikes this week, with demand vs supply/ops cause
+      views:
+      - view: table
+        from: top_causes
+        columns: &id001
+        - rank
+        - gap
+        - where
+        - change
+        - cause_type
+        - likely_cause
+        - suggested_action
+    - title: Summary
+      views:
+      - view: markdown
+        from: gap_summary
+  - id: review
+    name: Sales owner review
+    type: decision
+    after:
+    - diagnose_gaps
+    description: The sales owner reviews the diagnosed gaps and approves emailing the summary to sales,
+      ops and marketing, or holds it.
+    instruction: Review the diagnosed sales gaps (top_causes, gap_summary) and the full dips and spikes
+      tables. Recommend APPROVE to email the summary so the week's gaps are followed up in writing. Recommend
+      REJECT only when top_causes is empty (no gap this week). Keep the reasoning short and name the one
+      or two most urgent gaps.
+    decision_options:
+    - APPROVE
+    - REJECT
+    rationale_from: gap_summary
+    produces:
+    - review_decision
+    key_data:
+    - title: Top gaps and likely causes
+      views:
+      - view: table
+        from: top_causes
+        columns: *id001
+    - title: Sales dips (worst first)
+      summary: Every row 20% or more below its 4-week baseline, with drivers
+      views:
+      - view: table
+        from: sales_dips
+        columns: &id002
+        - LEVEL
+        - STORE_NAME
+        - CHANNEL
+        - ITEM_NAME
+        - SALES_CUR
+        - SALES_BASE
+        - VS_BASE_PCT
+        - WOW_PCT
+        - ORDERS_CHG_PCT
+        - AOV_CHG_PCT
+        - DRIVER_HINTS
+    - title: Sales spikes (biggest first)
+      summary: Every row 20% or more above its 4-week baseline, with drivers
+      views:
+      - view: table
+        from: sales_spikes
+        columns: *id002
+  - id: send_summary
+    name: Email sales-gap summary
+    type: notify
+    after:
+    - review
+    description: On approval, format the summary as a Genzoic HTML email (via the Genzoic Email Formatter
+      skill) and send it.
+    condition: '{{review_decision}} == "APPROVE"'
+    produces:
+    - summary_sent
+    action:
+      type: skill
+      name: email_sales_gap_summary
+      config:
+        type: skill
+        skill: genzoic-email-formatter
+        operation: send
+        args:
+          to: kaashvij06@gmail.com
+          subject: Sales gap diagnosis - weekly dips and spikes by store, channel and product
+          title: Sales Gap Diagnosis - Weekly
+          intro: '{{gap_summary}}'
+          sections:
+          - type: table
+            caption: Top gaps and likely causes
+            columns: *id001
+            records: '{{top_causes}}'
+          - type: table
+            caption: All sales dips - worst first
+            columns: &id003
+            - LEVEL
+            - STORE_NAME
+            - CHANNEL
+            - ITEM_NAME
+            - SALES_CUR
+            - SALES_BASE
+            - VS_BASE_PCT
+            - ORDERS_CHG_PCT
+            - AOV_CHG_PCT
+            - DRIVER_HINTS
+            records: '{{sales_dips}}'
+          - type: table
+            caption: All sales spikes - biggest first
+            columns: *id003
+            records: '{{sales_spikes}}'
+          footer_note: 'Generated automatically by the Sales Gap Diagnosis process. Latest sales week
+            vs the prior week and the 4-week baseline, on matched weekdays. Not in the data yet, so not
+            considered: kitchen prep time (KPT), store online availability, order cancellations, Swiggy
+            marketing, competitor pricing. Marketing figures are Zomato only.'
+  metadata:
+    tools:
+      skills: []
+    version: 1
+    key_data:
+    - title: Dips and spikes this week
+      summary: How many store x channel, channel and product rows moved 20% or more against the 4-week
+        baseline
+      views:
+      - from: gap_counts
+        view: table
+        columns:
+        - FLAG
+        - rows_flagged
+        - WEEK_END
+        - DAYS_CUR
+        - MKT_WEEK_END
+    priority: 10
+    policy_rules:
+    - '`sales_dips` and `sales_spikes` have ALREADY been computed and flagged by the system. Each row
+      is one flagged gap. `LEVEL` STORE is one store on one channel, CHANNEL is one channel across all
+      stores, and PRODUCT is one item across all stores and channels. `SALES_CUR` is the latest week''s
+      gross item sales (INR), `SALES_BASE` is the 4-week baseline scaled to the same number of days, and
+      `VS_BASE_PCT` / `WOW_PCT` are the % change vs the baseline and vs the prior week. `ORDERS_CHG_PCT`
+      and `AOV_CHG_PCT` split the move into fewer orders vs smaller baskets. A row is flagged at 20% or
+      more with a minimum baseline volume. Do NOT re-compute, re-filter or re-list every row.'
+    - '`DRIVER_HINTS` holds the evidence for the SAME store and week, already computed: order and AOV
+      change, Zomato ad spend and impressions change (latest marketing week, ending `MKT_WEEK_END`), rain
+      days vs the prior week, complaints vs the prior week, a low rating, SKUs low on stock now, and holidays
+      or occasions. Zomato marketing and weather ARE in the data: every Zomato row states its ad spend
+      as ''Zomato ads RsX (+Y%)'' (latest marketing week vs the one before) and ''impressions +/-Z%'',
+      and every STORE row states ''rain Nd (prev M)''. ''(+0%)'' or equal rain days means checked and
+      unchanged, so it did NOT cause the gap; say that, never that the data is missing. A Zomato row with
+      no ads phrase has no Zomato marketing mapped for that store. ''no driver in data'' means none of
+      those signals moved: say so plainly and do not invent a cause.'
+    - 'Explain the gaps that matter most, in plain business language: whether each came from fewer orders
+      or smaller baskets, and whether the likely cause is demand-side (marketing, visibility, occasions,
+      seasonality, weather), supply/ops-side (stock, complaints, rating) or a mix. Point out patterns
+      across stores or products, and say when the evidence is thin.'
+    - 'Data caveats, which you MUST state briefly: (1) `DAYS_CUR` is how many of the latest 7 days actually
+      loaded. When it is below 7, say that the comparison uses matched weekdays because some days are
+      missing from the sales feed. (2) Marketing is Zomato only and ends on `MKT_WEEK_END`, which can
+      be earlier than the sales week. (3) Not in the data at all: kitchen prep time (KPT), store online
+      availability, cancellations, Swiggy marketing and competitor pricing, so never cite them as a cause.
+      (4) A STORE row in a week when that store id was renamed (100010, 100012, 100025) can be a false
+      gap. (5) A PRODUCT row falling to 0 is usually a seasonal or gift item ending, not a stock problem.'
+    effective_from: '2026-09-28'
+    context_package:
+    - key: gap_counts
+      post:
+        where:
+        - op: ne
+          field: FLAG
+          value: NORMAL
+        rollup:
+          agg:
+          - as: rows_flagged
+            op: count
+            col: FLAG
+          - as: WEEK_END
+            op: first
+            col: WEEK_END
+          - as: DAYS_CUR
+            op: first
+            col: DAYS_CUR
+          - as: MKT_WEEK_END
+            op: first
+            col: MKT_WEEK_END
+          group_by:
+          - FLAG
+      gather:
+        base:
+          limit: 500
+          columns:
+          - FLAG
+          - WEEK_END
+          - DAYS_CUR
+          - MKT_WEEK_END
+          dataset: V_SALES_GAP_SIGNALS
+          entity_type: Store
+      required: false
+    - key: sales_dips
+      post:
+        where:
+        - op: eq
+          field: FLAG
+          value: DROP
+        sort_by: VS_BASE_PCT
+      gather:
+        base:
+          limit: 500
+          columns:
+          - LEVEL
+          - STORE_NAME
+          - CHANNEL
+          - ITEM_NAME
+          - WEEK_END
+          - DAYS_CUR
+          - SALES_CUR
+          - SALES_BASE
+          - VS_BASE_PCT
+          - WOW_PCT
+          - ORDERS_CHG_PCT
+          - AOV_CHG_PCT
+          - MKT_WEEK_END
+          - FLAG
+          - DRIVER_HINTS
+          dataset: V_SALES_GAP_SIGNALS
+          entity_type: Store
+      required: true
+    - key: sales_spikes
+      post:
+        where:
+        - op: eq
+          field: FLAG
+          value: SPIKE
+        compute:
+        - as: _neg_pct
+          sub:
+          - 0
+          - VS_BASE_PCT
+        sort_by: _neg_pct
+      gather:
+        base:
+          limit: 500
+          columns:
+          - LEVEL
+          - STORE_NAME
+          - CHANNEL
+          - ITEM_NAME
+          - WEEK_END
+          - DAYS_CUR
+          - SALES_CUR
+          - SALES_BASE
+          - VS_BASE_PCT
+          - WOW_PCT
+          - ORDERS_CHG_PCT
+          - AOV_CHG_PCT
+          - MKT_WEEK_END
+          - FLAG
+          - DRIVER_HINTS
+          dataset: V_SALES_GAP_SIGNALS
+          entity_type: Store
+      required: false
+    - key: scheduled_at
+      source: event
+      required: false
+    run_steps_before_gate: true
+    requires_human_approval: true

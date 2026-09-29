@@ -1,0 +1,64 @@
+version: 1
+title: Strategy to execution
+# Goal tree. Every kpi and process id referenced here must exist, or apply fails.
+goals:
+- id: grow_weekly_sales
+  name: Grow weekly sales
+  kind: enterprise
+  description: Keep sales, orders and basket size growing across every channel, store and product, and
+    catch a dip early enough to fix its cause.
+  horizon: FY26
+  owner: sales_team
+  contributors:
+  - marketing_team
+  - demand_planning_team
+  - cx_team
+  applies_to:
+  - Store
+  kpis:
+  - kpi: DailyGrossSales
+    aggregation: avg
+    cadence: Weekly
+  - kpi: DailyOrders
+    aggregation: avg
+    cadence: Weekly
+  - kpi: AverageOrderValue
+    aggregation: avg
+    cadence: Weekly
+  processes:
+  - sales_gap_diagnosis
+- id: spend_marketing_where_it_returns
+  parent: grow_weekly_sales
+  name: Spend marketing where it returns
+  kind: strategic
+  description: Keep Zomato ad spend earning at least twice its cost, and cut or move spend that does not.
+    Swiggy ads are not integrated yet.
+  horizon: FY26
+  owner: marketing_team
+  applies_to:
+  - Store
+  kpis:
+  - kpi: ZomatoROAS
+    aggregation: avg
+    cadence: Weekly
+  processes:
+  - sales_gap_diagnosis
+- id: keep_customers_happy
+  parent: grow_weekly_sales
+  name: Keep customers happy
+  kind: strategic
+  description: Hold complaints down and ratings up, so a quality or delivery problem does not turn into
+    lost orders.
+  horizon: FY26
+  owner: cx_team
+  applies_to:
+  - Store
+  kpis:
+  - kpi: WeeklyComplaints
+    aggregation: sum
+    cadence: Weekly
+  - kpi: AvgStoreRating
+    aggregation: avg
+    cadence: Weekly
+  processes:
+  - sales_gap_diagnosis
