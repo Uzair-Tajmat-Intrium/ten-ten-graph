@@ -121,9 +121,10 @@ processes:
       use figures from `zomato_rows` or simple arithmetic on them, and show the figures you used. Only
       cite causes you can see in the rows.
 
-      Output zomato_findings (rank, where, change, cause_type, likely_cause, suggested_action) for the
-      rows that matter most (up to 8), and a short zomato_summary. `change` is short text such as "<x>%
-      vs baseline, orders <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
+      Return both inside "outputs": zomato_findings = a list of (rank, where, change, cause_type, likely_cause,
+      suggested_action) for the rows that matter most (up to 8), and zomato_summary = a short summary.
+      `change` is short text such as "<x>% vs baseline, orders <y>%"; cause_type is DEMAND, SUPPLY_OPS,
+      MIXED or UNKNOWN.'
     produces:
     - zomato_findings
     - zomato_summary
@@ -197,9 +198,10 @@ processes:
       use figures from `marketing_input` or simple arithmetic on them, and show the figures you used.
       Only cite causes you can see in the rows.
 
-      Output marketing_findings (rank, where, change, cause_type, likely_cause, suggested_action) for
-      the rows that matter most (up to 8), and a short marketing_summary. `change` is short text such
-      as "<x>% vs baseline, orders <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
+      Return both inside "outputs": marketing_findings = a list of (rank, where, change, cause_type, likely_cause,
+      suggested_action) for the rows that matter most (up to 8), and marketing_summary = a short summary.
+      `change` is short text such as "<x>% vs baseline, orders <y>%"; cause_type is DEMAND, SUPPLY_OPS,
+      MIXED or UNKNOWN.'
     produces:
     - marketing_findings
     - marketing_summary
@@ -266,9 +268,10 @@ processes:
       use figures from `swiggy_rows` or simple arithmetic on them, and show the figures you used. Only
       cite causes you can see in the rows.
 
-      Output swiggy_findings (rank, where, change, cause_type, likely_cause, suggested_action) for the
-      rows that matter most (up to 8), and a short swiggy_summary. `change` is short text such as "<x>%
-      vs baseline, orders <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
+      Return both inside "outputs": swiggy_findings = a list of (rank, where, change, cause_type, likely_cause,
+      suggested_action) for the rows that matter most (up to 8), and swiggy_summary = a short summary.
+      `change` is short text such as "<x>% vs baseline, orders <y>%"; cause_type is DEMAND, SUPPLY_OPS,
+      MIXED or UNKNOWN.'
     produces:
     - swiggy_findings
     - swiggy_summary
@@ -323,9 +326,10 @@ processes:
       use figures from `product_input` or simple arithmetic on them, and show the figures you used. Only
       cite causes you can see in the rows.
 
-      Output product_findings (rank, where, change, cause_type, likely_cause, suggested_action) for the
-      rows that matter most (up to 8), and a short product_summary. `change` is short text such as "<x>%
-      vs baseline, units <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
+      Return both inside "outputs": product_findings = a list of (rank, where, change, cause_type, likely_cause,
+      suggested_action) for the rows that matter most (up to 8), and product_summary = a short summary.
+      `change` is short text such as "<x>% vs baseline, units <y>%"; cause_type is DEMAND, SUPPLY_OPS,
+      MIXED or UNKNOWN.'
     produces:
     - product_findings
     - product_summary
