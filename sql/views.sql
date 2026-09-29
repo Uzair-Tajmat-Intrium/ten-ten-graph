@@ -1387,9 +1387,10 @@ sales AS (
   GROUP BY LEVEL, K_STORE, K_CH, K_SKU
 ),
 -- ---------------------------------------------------------------- drivers
--- Marketing lags sales by several days (it ended 21 Sep while sales ran to 27 Sep), so
--- it gets its OWN anchor: its latest 7 loaded days vs the 7 before. Anchoring it on the
--- sales week would compare a part-empty week and fake an ~86% spend cut.
+-- Marketing lags sales and has its OWN whole-day gaps (it stopped at 21 Sep, then had no
+-- rows at all for 22-25 Sep), so it gets its own anchor AND is compared on DAILY RATES over
+-- the days that actually loaded: AD_SPEND_* and IMPR_* are per-loaded-day averages. Raw
+-- 7-day totals faked an ~86%, then ~60%, "spend cut" when spend was flat at ~Rs4.6k/day.
 mkt_anchor AS (
   SELECT MAX(DATE) AS MA FROM `gen-lang-client-0520145261.bronze.RAW_MARKETING_DATA`
 ),
@@ -1398,24 +1399,31 @@ mkt_daily AS (
   SELECT
     m.RES_ID,
     m.DATE,
+    m.DATE >= DATE_SUB(ma.MA, INTERVAL 6 DAY) AS IS_CUR,
     SUM(m.AD_SPEND_RS)        AS SPEND,
     MAX(m.TOTAL_IMPRESSIONS)  AS IMPR
   FROM `gen-lang-client-0520145261.bronze.RAW_MARKETING_DATA` m
   CROSS JOIN mkt_anchor ma
   WHERE m.DATE BETWEEN DATE_SUB(ma.MA, INTERVAL 13 DAY) AND ma.MA
-  GROUP BY 1, 2
+  GROUP BY 1, 2, 3
+),
+mkt_cov AS (
+  SELECT
+    COUNT(DISTINCT IF(IS_CUR,     DATE, NULL)) AS MKT_DAYS_CUR,
+    COUNT(DISTINCT IF(NOT IS_CUR, DATE, NULL)) AS MKT_DAYS_PREV
+  FROM mkt_daily
 ),
 mkt_store AS (
   SELECT
     scm.MASTER_STORE_ID,
-    SUM(IF(d.DATE >= DATE_SUB(ma.MA, INTERVAL 6 DAY), d.SPEND, 0)) AS AD_SPEND_CUR,
-    SUM(IF(d.DATE <  DATE_SUB(ma.MA, INTERVAL 6 DAY), d.SPEND, 0)) AS AD_SPEND_PREV,
-    SUM(IF(d.DATE >= DATE_SUB(ma.MA, INTERVAL 6 DAY), d.IMPR,  0)) AS IMPR_CUR,
-    SUM(IF(d.DATE <  DATE_SUB(ma.MA, INTERVAL 6 DAY), d.IMPR,  0)) AS IMPR_PREV
+    SAFE_DIVIDE(SUM(IF(d.IS_CUR,     d.SPEND, 0)), ANY_VALUE(mc.MKT_DAYS_CUR))  AS AD_SPEND_CUR,
+    SAFE_DIVIDE(SUM(IF(NOT d.IS_CUR, d.SPEND, 0)), ANY_VALUE(mc.MKT_DAYS_PREV)) AS AD_SPEND_PREV,
+    SAFE_DIVIDE(SUM(IF(d.IS_CUR,     d.IMPR,  0)), ANY_VALUE(mc.MKT_DAYS_CUR))  AS IMPR_CUR,
+    SAFE_DIVIDE(SUM(IF(NOT d.IS_CUR, d.IMPR,  0)), ANY_VALUE(mc.MKT_DAYS_PREV)) AS IMPR_PREV
   FROM mkt_daily d
   JOIN `gen-lang-client-0520145261.bronze.STORE_CHANNEL_MAPPING` scm
     ON scm.ZOMATO_ID = SAFE_CAST(d.RES_ID AS INT64)
-  CROSS JOIN mkt_anchor ma
+  CROSS JOIN mkt_cov mc
   GROUP BY 1
 ),
 mkt_all AS (
@@ -1517,7 +1525,8 @@ joined AS (
     cv.DAYS_CUR,
     cv.DAYS_PREV,
     cv.DAYS_BASE,
-    mka_d.MA AS MKT_WEEK_END
+    mka_d.MA AS MKT_WEEK_END,
+    mc.MKT_DAYS_CUR
   FROM sales s
   LEFT JOIN `gen-lang-client-0520145261.bronze.MASTER_STORE` ms
     ON s.LEVEL = 'STORE' AND ms.MASTER_STORE_ID = s.K_STORE
@@ -1540,6 +1549,7 @@ joined AS (
   CROSS JOIN occasions o
   CROSS JOIN coverage cv
   CROSS JOIN mkt_anchor mka_d
+  CROSS JOIN mkt_cov mc
 ),
 rated AS (
   SELECT
@@ -1589,8 +1599,8 @@ SELECT
   AOV_CUR,
   AOV_PREV,
   AOV_CHG_PCT,
-  ROUND(AD_SPEND_CUR, 0)                   AS AD_SPEND_CUR,
-  ROUND(AD_SPEND_PREV, 0)                  AS AD_SPEND_PREV,
+  ROUND(AD_SPEND_CUR, 0)                   AS AD_SPEND_CUR,   -- Rs per loaded day
+  ROUND(AD_SPEND_PREV, 0)                  AS AD_SPEND_PREV,  -- Rs per loaded day
   IMPRESSIONS_CHG_PCT,
   COMPLAINTS_CUR,
   COMPLAINTS_PREV,
@@ -1600,6 +1610,7 @@ SELECT
   LOW_STOCK_STORES,
   OCCASIONS_CUR,
   MKT_WEEK_END,
+  MKT_DAYS_CUR,
   CASE
     WHEN SALES_BASE >= MIN_BASE AND VS_BASE_PCT <= -20 THEN 'DROP'
     WHEN SALES_BASE >= MIN_BASE AND VS_BASE_PCT >=  20 THEN 'SPIKE'
@@ -1609,6 +1620,7 @@ SELECT
   -- missing hint reads to the agent as "no data", not "checked and unchanged".
   -- Phrases are kept short — the diagnose step reads every flagged row in 9000 chars.
   COALESCE(NULLIF(ARRAY_TO_STRING([
+    IF(LEVEL = 'PRODUCT' AND SALES_CUR = 0 AND SALES_PREV = 0, 'no sales for 2 weeks (seasonal or delisted item)', NULL),
     IF(ABS(ORDERS_CHG_PCT) >= 15, FORMAT('orders %+.0f%%', ORDERS_CHG_PCT), NULL),
     IF(ABS(AOV_CHG_PCT)    >= 15, FORMAT('AOV %+.0f%% (Rs%.0f vs %.0f)', AOV_CHG_PCT, AOV_CUR, AOV_PREV), NULL),
     CASE
@@ -1616,7 +1628,8 @@ SELECT
       WHEN AD_SPEND_PREV > 0 AND AD_SPEND_CUR = 0    THEN 'Zomato ads stopped'
       WHEN COALESCE(AD_SPEND_PREV, 0) = 0 AND AD_SPEND_CUR > 0 THEN 'Zomato ads started'
       WHEN COALESCE(AD_SPEND_PREV, 0) = 0            THEN 'no Zomato ads'
-      ELSE FORMAT('Zomato ads Rs%.0f (%+.0f%%)', AD_SPEND_CUR, AD_SPEND_CHG_PCT)
+      ELSE FORMAT('Zomato ads Rs%.0f/day (%+.0f%%%s)', AD_SPEND_CUR, AD_SPEND_CHG_PCT,
+                  IF(MKT_DAYS_CUR < 7, FORMAT(', %d of 7 days loaded', MKT_DAYS_CUR), ''))
     END,
     IF(IMPRESSIONS_CHG_PCT IS NOT NULL, FORMAT('impressions %+.0f%%', IMPRESSIONS_CHG_PCT), NULL),
     IF(COMPLAINTS_CUR >= 2 AND COMPLAINTS_CUR > COMPLAINTS_PREV, FORMAT('complaints %d (prev %d)', COMPLAINTS_CUR, COMPLAINTS_PREV), NULL),

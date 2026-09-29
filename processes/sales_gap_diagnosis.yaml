@@ -96,10 +96,14 @@ processes:
     instruction: 'Explain why sales moved this week and what to look at first.
 
       `gap_rows` lists every store/channel/product that moved 20% or more vs its 4-week baseline, with
-      the likely drivers in DRIVER_HINTS. Don''t make anything up. Only cite what''s actually in the data.
+      the likely drivers in DRIVER_HINTS. Don''t make anything up, especially numbers: only cite figures
+      that appear in `gap_rows` exactly as given, and never estimate, round up or invent a number.
 
       Output top_causes (rank, gap, where, change, cause_type, likely_cause, suggested_action) for the
-      gaps that matter, and a short gap_summary.'
+      gaps that matter, and a short gap_summary.
+
+      `change` is short text (e.g. "-55% vs baseline, orders -54%"); cause_type is DEMAND, SUPPLY_OPS,
+      MIXED or UNKNOWN.'
     produces:
     - top_causes
     - gap_summary
