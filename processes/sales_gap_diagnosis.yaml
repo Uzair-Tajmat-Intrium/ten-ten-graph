@@ -122,8 +122,8 @@ processes:
       cite causes you can see in the rows.
 
       Output zomato_findings (rank, where, change, cause_type, likely_cause, suggested_action) for the
-      rows that matter, and a short zomato_summary. `change` is short text such as "<x>% vs baseline,
-      orders <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
+      rows that matter most (up to 8), and a short zomato_summary. `change` is short text such as "<x>%
+      vs baseline, orders <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
     produces:
     - zomato_findings
     - zomato_summary
@@ -198,8 +198,8 @@ processes:
       Only cite causes you can see in the rows.
 
       Output marketing_findings (rank, where, change, cause_type, likely_cause, suggested_action) for
-      the rows that matter, and a short marketing_summary. `change` is short text such as "<x>% vs baseline,
-      orders <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
+      the rows that matter most (up to 8), and a short marketing_summary. `change` is short text such
+      as "<x>% vs baseline, orders <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
     produces:
     - marketing_findings
     - marketing_summary
@@ -267,8 +267,8 @@ processes:
       cite causes you can see in the rows.
 
       Output swiggy_findings (rank, where, change, cause_type, likely_cause, suggested_action) for the
-      rows that matter, and a short swiggy_summary. `change` is short text such as "<x>% vs baseline,
-      orders <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
+      rows that matter most (up to 8), and a short swiggy_summary. `change` is short text such as "<x>%
+      vs baseline, orders <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
     produces:
     - swiggy_findings
     - swiggy_summary
@@ -324,8 +324,8 @@ processes:
       cite causes you can see in the rows.
 
       Output product_findings (rank, where, change, cause_type, likely_cause, suggested_action) for the
-      rows that matter, and a short product_summary. `change` is short text such as "<x>% vs baseline,
-      orders <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
+      rows that matter most (up to 8), and a short product_summary. `change` is short text such as "<x>%
+      vs baseline, units <y>%"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN.'
     produces:
     - product_findings
     - product_summary
