@@ -1,0 +1,130 @@
+version: 1
+# Sales-health KPIs behind the grow_weekly_sales goal and the sales_gap_diagnosis process.
+#
+# Each KPI is ONE network-level number. The per-store / per-channel / per-product breakdown
+# and the likely drivers come from bronze.V_SALES_GAP_SIGNALS (sql/sales_gap_views.sql),
+# read by the process — a KPI cannot carry that.
+#
+# Shared rules (same traps the view handles):
+#   * Anchored on each source's own latest date, never CURRENT_DATE(): sales run a day
+#     behind and marketing several days behind.
+#   * Sales are UNIT_PRICE * QUANTITY (TOTAL/NET are order-level values repeated per line);
+#     orders are COUNT(DISTINCT ORDER_ID).
+#   * Sales and orders are PER LOADED DAY over the last 7 days, because the load has whole-day
+#     gaps (no rows at all for 23-24 Sep 2026) that would otherwise read as a slump.
+#   * Cancellations are NOT in silver.BUSINESS_ANALYTICS (zero 'Cancelled' rows), so there is
+#     no cancellation KPI yet.
+# Targets are starting points set near the Aug-Sep 2026 baseline — review with the business.
+kpis:
+- id: DailyGrossSales
+  name: Daily Gross Sales (7-day avg)
+  description: Average gross item sales per trading day over the last 7 days (INR, before discounts,
+    cancelled orders excluded). Averaged over days that actually have data so a load gap is not a slump.
+  owner: sales_team
+  applies_to: Store
+  unit: inr
+  target:
+    value: 50000
+    comparison: gte
+  computed_by:
+    source: bigquery
+    network_query: "WITH a AS (\n  SELECT MAX(ORDER_DATE) AS A\n  FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS`\n\
+      )\nSELECT ROUND(SUM(b.UNIT_PRICE * b.QUANTITY) / NULLIF(COUNT(DISTINCT b.ORDER_DATE), 0), 0) AS VALUE\n\
+      FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS` b\nCROSS JOIN a\nWHERE b.ORDER_STATE <> 'Cancelled'\n\
+      \  AND b.ORDER_DATE > DATE_SUB(a.A, INTERVAL 7 DAY)\n"
+  refresh:
+    cache_ttl: 12h
+  related_processes: [sales_gap_diagnosis]
+- id: DailyOrders
+  name: Daily Orders (7-day avg)
+  description: Average distinct non-cancelled orders per trading day over the last 7 days. Separates fewer
+    customers from smaller baskets when sales move.
+  owner: sales_team
+  applies_to: Store
+  unit: count
+  target:
+    value: 65
+    comparison: gte
+  computed_by:
+    source: bigquery
+    network_query: "WITH a AS (\n  SELECT MAX(ORDER_DATE) AS A\n  FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS`\n\
+      )\nSELECT ROUND(COUNT(DISTINCT b.ORDER_ID) / NULLIF(COUNT(DISTINCT b.ORDER_DATE), 0), 1) AS VALUE\n\
+      FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS` b\nCROSS JOIN a\nWHERE b.ORDER_STATE <> 'Cancelled'\n\
+      \  AND b.ORDER_DATE > DATE_SUB(a.A, INTERVAL 7 DAY)\n"
+  refresh:
+    cache_ttl: 12h
+  related_processes: [sales_gap_diagnosis]
+- id: AverageOrderValue
+  name: Average Order Value (7-day)
+  description: Gross item sales divided by distinct non-cancelled orders over the last 7 days (INR, before
+    discounts). Computed per order, never from the order-level TOTAL column.
+  owner: sales_team
+  applies_to: Store
+  unit: inr
+  target:
+    value: 750
+    comparison: gte
+  computed_by:
+    source: bigquery
+    network_query: "WITH a AS (\n  SELECT MAX(ORDER_DATE) AS A\n  FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS`\n\
+      )\nSELECT ROUND(SUM(b.UNIT_PRICE * b.QUANTITY) / NULLIF(COUNT(DISTINCT b.ORDER_ID), 0), 0) AS VALUE\n\
+      FROM `gen-lang-client-0520145261.silver.BUSINESS_ANALYTICS` b\nCROSS JOIN a\nWHERE b.ORDER_STATE <> 'Cancelled'\n\
+      \  AND b.ORDER_DATE > DATE_SUB(a.A, INTERVAL 7 DAY)\n"
+  refresh:
+    cache_ttl: 12h
+  related_processes: [sales_gap_diagnosis]
+- id: ZomatoROAS
+  name: Zomato Return on Ad Spend (7-day)
+  description: Zomato ad-attributed sales divided by Zomato ad spend over the latest 7 days of marketing data.
+    Zomato only; Swiggy ads are not integrated. Marketing lags sales by several days, so it is anchored on its
+    own latest date.
+  owner: marketing_team
+  applies_to: Store
+  unit: ratio
+  target:
+    value: 2.0
+    comparison: gte
+  computed_by:
+    source: bigquery
+    network_query: "WITH a AS (\n  SELECT MAX(DATE) AS A\n  FROM `gen-lang-client-0520145261.bronze.RAW_MARKETING_DATA`\n\
+      )\nSELECT ROUND(SUM(m.AD_SALES_RS) / NULLIF(SUM(m.AD_SPEND_RS), 0), 2) AS VALUE\nFROM `gen-lang-client-0520145261.bronze.RAW_MARKETING_DATA`\
+      \ m\nCROSS JOIN a\nWHERE m.DATE > DATE_SUB(a.A, INTERVAL 7 DAY)\n"
+  refresh:
+    cache_ttl: 12h
+  related_processes: [sales_gap_diagnosis]
+- id: WeeklyComplaints
+  name: Customer Complaints (7-day)
+  description: Distinct complained orders over the latest 7 days of complaint data (almost all Zomato). Counted
+    by ORDER_ID because EVENT_ID is null on most rows.
+  owner: cx_team
+  applies_to: Store
+  unit: count
+  target:
+    value: 3
+    comparison: lte
+  computed_by:
+    source: bigquery
+    network_query: "WITH a AS (\n  SELECT MAX(DATE(COMPLAINT_RECEIVED_AT)) AS A\n  FROM `gen-lang-client-0520145261.bronze.CUSTOMER_COMPLAINT_EVENTS`\n\
+      )\nSELECT COUNT(DISTINCT c.ORDER_ID) AS VALUE\nFROM `gen-lang-client-0520145261.bronze.CUSTOMER_COMPLAINT_EVENTS`\
+      \ c\nCROSS JOIN a\nWHERE DATE(c.COMPLAINT_RECEIVED_AT) > DATE_SUB(a.A, INTERVAL 7 DAY)\n"
+  refresh:
+    cache_ttl: 12h
+  related_processes: [sales_gap_diagnosis]
+- id: AvgStoreRating
+  name: Average Store Rating (30-day)
+  description: Mean star rating over the latest 30 days of reviews (Zomato), de-duplicated on REVIEW_ID.
+    Thin data (~30 reviews a month), so read it as a direction, not a precise score.
+  owner: cx_team
+  applies_to: Store
+  unit: rating
+  target:
+    value: 4.0
+    comparison: gte
+  computed_by:
+    source: bigquery
+    network_query: "WITH r AS (\n  SELECT DISTINCT REVIEW_ID, CAST(STAR_RATING AS FLOAT64) AS STAR_RATING, DATE(REVIEW_DATE)\
+      \ AS D\n  FROM `gen-lang-client-0520145261.bronze.CUSTOMER_REVIEW_EVENTS`\n)\nSELECT ROUND(AVG(STAR_RATING), 2) AS\
+      \ VALUE\nFROM r\nWHERE D > DATE_SUB((SELECT MAX(D) FROM r), INTERVAL 30 DAY)\n"
+  refresh:
+    cache_ttl: 12h
+  related_processes: [sales_gap_diagnosis]

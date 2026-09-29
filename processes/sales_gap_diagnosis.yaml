@@ -1,0 +1,526 @@
+# Sales Gap Diagnosis: weekly look at why sales moved - Zomato store performance, Zomato marketing
+# effectiveness, Swiggy / other channels, and product performance - then a review gate
+# and an email on approval.
+# Data: three RAW views in sql/views.sql (V_SALES_GAP_STORE, V_SALES_GAP_PRODUCT,
+# V_SALES_GAP_ZOMATO_MKT). They hold numbers only; each diagnose step reads every row and decides
+# what moved. Four steps, not one, because a step sees only ~9000 chars of its own fetch; each
+# fetch picks only the columns it needs (constant columns like WEEK_END are left out).
+# Reads use `entity_type` (one cross-store query), not `entity` (one query per Store entity):
+# the views carry 'All stores' rows with MASTER_STORE_ID = 'ALL', which is not a real store.
+# Unmapped items (hampers, gift boxes; SKU_ID 'UNKNOWN') are filtered out here, not in the view.
+version: 1
+processes:
+- id: sales_gap_diagnosis
+  name: Sales Gap Diagnosis
+  description: 'Weekly look at why sales moved, in four parts: every store on Zomato, every store on Swiggy
+    and other channels, every product, and the Zomato marketing funnel. The views hold raw numbers only
+    (latest week, the week before and the 4-week baseline); the agent decides what moved and why. On approval,
+    the summary is emailed to the sales, ops and marketing owners.
+
+    '
+  domain: Sales
+  owner: sales_team
+  applies_to:
+  - entity: Store
+  - entity: Store
+    where:
+    - op: ne
+      field: id
+      value: __none__
+  triggers:
+  - type: schedule
+    cron: 0 8 * * 1
+  - type: event
+    event_type: sales_gap_diagnosis
+  - type: manual
+    allowed_roles:
+    - DemandPlanner
+    - SalesManager
+  inputs:
+  - name: store_id
+    type: reference
+    references: Store
+  - name: scheduled_at
+    type: datetime
+  outputs:
+  - name: decision
+    type: enum
+    values:
+    - APPROVE
+    - REJECT
+  - name: zomato_findings
+    type: object
+  - name: swiggy_findings
+    type: object
+  - name: product_findings
+    type: object
+  - name: marketing_findings
+    type: object
+  related_kpis:
+  - DailyGrossSales
+  - DailyOrders
+  - AverageOrderValue
+  - ZomatoROAS
+  - WeeklyComplaints
+  - AvgStoreRating
+  steps:
+  - id: zomato_store_performance
+    name: 'Zomato: store performance'
+    type: agent
+    description: How each store's Zomato sales, orders and basket size moved this week vs last week and
+      the 4-week baseline, and why.
+    fetch:
+      entity_type: Store
+      source_table: V_SALES_GAP_STORE
+      columns:
+      - STORE_NAME
+      - SALES_CUR
+      - SALES_PREV
+      - SALES_BASE
+      - ORDERS_CUR
+      - ORDERS_PREV
+      - ORDERS_BASE
+      - AOV_CUR
+      - AOV_PREV
+      - SPEND_DAY_CUR
+      - SPEND_DAY_PREV
+      - ROI_CUR
+      - ROI_PREV
+      - IMPR_DAY_CUR
+      - IMPR_DAY_PREV
+      - M2O_CUR
+      - M2O_PREV
+      - COMPLAINTS_CUR
+      - COMPLAINTS_PREV
+      - REVIEWS_CUR
+      - RATING_CUR
+      - RAIN_DAYS_CUR
+      - RAIN_DAYS_PREV
+      - OCCASIONS_CUR
+      - OCCASIONS_PREV
+      filters:
+        combinator: AND
+        conditions:
+        - column: CHANNEL
+          op: eq
+          value: Zomato
+      order_by: SALES_BASE
+      order_dir: desc
+      limit: 50
+      required: true
+      as: zomato_rows
+    instruction: 'Analyse this week''s sales for each store on Zomato and identify the likely causes.
+
+      `zomato_rows` holds one row per store on Zomato, plus an "All stores" row for the channel total.
+      Suffixes: _CUR is the latest week, _PREV the preceding week and _BASE the 4-week average; all are
+      scaled to the same number of days and are directly comparable. SPEND_DAY, ROI, IMPR_DAY and M2O
+      are per-day Zomato marketing figures for the latest marketing week and the week before. COMPLAINTS,
+      REVIEWS, RATING and RAIN_DAYS are store-level; OCCASIONS lists the holidays in each week.
+
+      Derive all changes from these columns. Use only figures present in `zomato_rows` or obtained from
+      them by simple arithmetic, cite the figures used, and attribute a cause only where the data supports
+      it.
+
+      Return both results inside "outputs". zomato_findings: up to 8 objects for the most significant
+      moves, each using exactly these keys and no others: rank, store, trend, sales_baseline, sales_last_week,
+      sales_this_week, change_vs_baseline, orders, aov, driven_by, marketing, cause_type, likely_reason,
+      action, owner. Values: rank is 1 for the most important; trend is UP, DOWN or FLAT; the sales_ values
+      are in Rs; change_vs_baseline is the % change of this week vs the baseline, e.g. "-41.1%"; orders
+      is "baseline -> this week"; aov is "last week -> this week" in Rs; driven_by is ORDERS, BASKET SIZE
+      or BOTH; marketing is one line of text with the relevant marketing figures, last week -> this week;
+      cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN; likely_reason is one sentence citing the figures;
+      action is one concrete next step; owner is Marketing, Store ops, CX or Category. zomato_summary:
+      a brief summary.'
+    produces:
+    - zomato_findings
+    - zomato_summary
+    key_data:
+    - title: 'Zomato: store performance'
+      views:
+      - view: table
+        from: zomato_findings
+        columns: &id001
+        - rank
+        - store
+        - trend
+        - sales_baseline
+        - sales_last_week
+        - sales_this_week
+        - change_vs_baseline
+        - orders
+        - aov
+        - driven_by
+        - marketing
+        - cause_type
+        - likely_reason
+        - action
+        - owner
+    - title: Zomato summary
+      views:
+      - view: markdown
+        from: zomato_summary
+  - id: zomato_marketing_effectiveness
+    name: 'Zomato: marketing effectiveness'
+    type: agent
+    after:
+    - zomato_store_performance
+    description: 'Whether Zomato ad spend is working: spend, visibility, clicks, conversion and ROI by
+      store, this week vs last.'
+    fetch:
+      entity_type: Store
+      source_table: V_SALES_GAP_ZOMATO_MKT
+      columns:
+      - STORE_NAME
+      - CAMPAIGNS
+      - AD_TYPE
+      - TARGETING
+      - SEGMENTS
+      - SPEND_DAY_CUR
+      - SPEND_DAY_PREV
+      - ROI_CUR
+      - ROI_PREV
+      - BUDGET_USED_CUR
+      - BUDGET_USED_PREV
+      - AD_ORD_DAY_CUR
+      - AD_ORD_DAY_PREV
+      - ADS_CTR_CUR
+      - ADS_CTR_PREV
+      - ADS_M2O_CUR
+      - ADS_M2O_PREV
+      - IMPR_DAY_CUR
+      - IMPR_DAY_PREV
+      - ORD_DAY_CUR
+      - ORD_DAY_PREV
+      - CTR_CUR
+      - CTR_PREV
+      - M2O_CUR
+      - M2O_PREV
+      order_by: SPEND_DAY_CUR
+      order_dir: desc
+      limit: 50
+      required: true
+      as: marketing_input
+    instruction: 'Assess the effectiveness of Zomato marketing at each store and identify the likely causes
+      of change.
+
+      `marketing_input` holds one row per Zomato store, plus an "All stores" row, including the campaign
+      running this week (AD_TYPE, TARGETING, SEGMENTS). _CUR is the latest marketing week and _PREV the
+      preceding week; there is no baseline. _DAY values are per day. ROI is ad sales divided by ad spend;
+      BUDGET_USED is ad spend as a % of booked budget; ADS_ columns describe the ad funnel and the others
+      the whole restaurant; CTR is clicks divided by impressions (%); M2O is orders divided by menu opens
+      (%).
+
+      Derive all changes from these columns. Use only figures present in `marketing_input` or obtained
+      from them by simple arithmetic, cite the figures used, and attribute a cause only where the data
+      supports it.
+
+      Return both results inside "outputs". marketing_findings: up to 8 objects for the most significant
+      moves, each using exactly these keys and no others: rank, store, campaign, segments, targeting,
+      spend_per_day, budget_used, roi, impressions_per_day, ad_conversion, store_conversion, orders_per_day,
+      verdict, likely_reason, action. Values: rank is 1 for the most important; campaign, segments and
+      targeting come from AD_TYPE, SEGMENTS and TARGETING; spend_per_day (Rs), budget_used (%), roi, impressions_per_day,
+      ad_conversion (ADS_M2O %), store_conversion (M2O %) and orders_per_day are each "last week -> this
+      week"; verdict is SCALE, KEEP, FIX or CUT; likely_reason is one sentence citing the figures; action
+      is one concrete next step. marketing_summary: a brief summary.'
+    produces:
+    - marketing_findings
+    - marketing_summary
+    key_data:
+    - title: 'Zomato: marketing effectiveness'
+      views:
+      - view: table
+        from: marketing_findings
+        columns: &id002
+        - rank
+        - store
+        - campaign
+        - segments
+        - targeting
+        - spend_per_day
+        - budget_used
+        - roi
+        - impressions_per_day
+        - ad_conversion
+        - store_conversion
+        - orders_per_day
+        - verdict
+        - likely_reason
+        - action
+    - title: Marketing summary
+      views:
+      - view: markdown
+        from: marketing_summary
+  - id: swiggy_store_performance
+    name: 'Swiggy and other channels: store performance'
+    type: agent
+    after:
+    - zomato_marketing_effectiveness
+    description: How each store's Swiggy (and other channel) sales, orders and basket size moved, and
+      why.
+    fetch:
+      entity_type: Store
+      source_table: V_SALES_GAP_STORE
+      columns:
+      - STORE_NAME
+      - CHANNEL
+      - SALES_CUR
+      - SALES_PREV
+      - SALES_BASE
+      - ORDERS_CUR
+      - ORDERS_PREV
+      - ORDERS_BASE
+      - AOV_CUR
+      - AOV_PREV
+      - COMPLAINTS_CUR
+      - COMPLAINTS_PREV
+      - REVIEWS_CUR
+      - RATING_CUR
+      - RAIN_DAYS_CUR
+      - RAIN_DAYS_PREV
+      - OCCASIONS_CUR
+      - OCCASIONS_PREV
+      filters:
+        combinator: AND
+        conditions:
+        - column: CHANNEL
+          op: in
+          value:
+          - Swiggy
+          - Other
+      order_by: SALES_BASE
+      order_dir: desc
+      limit: 50
+      required: true
+      as: swiggy_rows
+    instruction: 'Analyse this week''s sales for each store on Swiggy and other channels and identify
+      the likely causes.
+
+      `swiggy_rows` holds one row per store and channel, plus an "All stores" row for each channel total.
+      Suffixes: _CUR is the latest week, _PREV the preceding week and _BASE the 4-week average; all are
+      scaled to the same number of days and are directly comparable. No Swiggy marketing data is available.
+      COMPLAINTS, REVIEWS, RATING and RAIN_DAYS are store-level; OCCASIONS lists the holidays in each
+      week.
+
+      Derive all changes from these columns. Use only figures present in `swiggy_rows` or obtained from
+      them by simple arithmetic, cite the figures used, and attribute a cause only where the data supports
+      it.
+
+      Return both results inside "outputs". swiggy_findings: up to 8 objects for the most significant
+      moves, each using exactly these keys and no others: rank, store, channel, trend, sales_baseline,
+      sales_last_week, sales_this_week, change_vs_baseline, orders, aov, driven_by, cause_type, likely_reason,
+      action, owner. Values: rank is 1 for the most important; channel is Swiggy or Other; trend is UP,
+      DOWN or FLAT; the sales_ values are in Rs; change_vs_baseline is the % change of this week vs the
+      baseline, e.g. "-41.1%"; orders is "baseline -> this week"; aov is "last week -> this week" in Rs;
+      driven_by is ORDERS, BASKET SIZE or BOTH; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN; likely_reason
+      is one sentence citing the figures; action is one concrete next step; owner is Marketing, Store
+      ops, CX or Category. swiggy_summary: a brief summary.'
+    produces:
+    - swiggy_findings
+    - swiggy_summary
+    key_data:
+    - title: 'Swiggy and other channels: store performance'
+      views:
+      - view: table
+        from: swiggy_findings
+        columns: &id003
+        - rank
+        - store
+        - channel
+        - trend
+        - sales_baseline
+        - sales_last_week
+        - sales_this_week
+        - change_vs_baseline
+        - orders
+        - aov
+        - driven_by
+        - cause_type
+        - likely_reason
+        - action
+        - owner
+    - title: Swiggy summary
+      views:
+      - view: markdown
+        from: swiggy_summary
+  - id: product_performance
+    name: Product performance
+    type: agent
+    after:
+    - swiggy_store_performance
+    description: Which products gained or lost sales and units across all stores and channels, and why.
+    fetch:
+      entity_type: Product
+      source_table: V_SALES_GAP_PRODUCT
+      columns:
+      - ITEM_NAME
+      - SALES_CUR
+      - SALES_PREV
+      - SALES_BASE
+      - UNITS_CUR
+      - UNITS_PREV
+      - UNITS_BASE
+      - COMPLAINTS_CUR
+      - COMPLAINTS_PREV
+      filters:
+        combinator: AND
+        conditions:
+        - column: SKU_ID
+          op: ne
+          value: UNKNOWN
+      order_by: SALES_BASE
+      order_dir: desc
+      limit: 100
+      required: true
+      as: product_input
+    instruction: 'Analyse this week''s sales for each product across all stores and channels and identify
+      the likely causes.
+
+      `product_input` holds one row per product. Suffixes: _CUR is the latest week, _PREV the preceding
+      week and _BASE the 4-week average; all are scaled to the same number of days and are directly comparable.
+      UNITS are item quantities sold; COMPLAINTS are complaints linked to the product through the order.
+
+      Derive all changes from these columns. Use only figures present in `product_input` or obtained from
+      them by simple arithmetic, cite the figures used, and attribute a cause only where the data supports
+      it.
+
+      Return both results inside "outputs". product_findings: up to 8 objects for the most significant
+      moves, each using exactly these keys and no others: rank, product, trend, sales_baseline, sales_this_week,
+      change_vs_baseline, units, complaints, cause_type, likely_reason, action, owner. Values: rank is
+      1 for the most important; trend is UP, DOWN or FLAT; the sales_ values are in Rs; change_vs_baseline
+      is the % change of this week vs the baseline, e.g. "-41.1%"; units is "baseline -> this week"; complaints
+      is "last week -> this week"; cause_type is DEMAND, SUPPLY_OPS, MIXED or UNKNOWN; likely_reason is
+      one sentence citing the figures; action is one concrete next step; owner is Marketing, Store ops,
+      CX or Category. product_summary: a brief summary.'
+    produces:
+    - product_findings
+    - product_summary
+    key_data:
+    - title: Product performance
+      views:
+      - view: table
+        from: product_findings
+        columns: &id004
+        - rank
+        - product
+        - trend
+        - sales_baseline
+        - sales_this_week
+        - change_vs_baseline
+        - units
+        - complaints
+        - cause_type
+        - likely_reason
+        - action
+        - owner
+    - title: Product summary
+      views:
+      - view: markdown
+        from: product_summary
+  - id: sales_head_review
+    name: Sales head review
+    type: decision
+    after:
+    - product_performance
+    description: The sales head reviews the week's findings and approves sending the brief to sales, ops
+      and marketing, or holds it.
+    instruction: Review the findings on Zomato store performance, Zomato marketing effectiveness, Swiggy
+      and other channels, and product performance. Recommend APPROVE to issue the weekly sales brief so
+      that the week's movements are followed up in writing, or REJECT if no material movement was found.
+      Give the reasoning briefly and name the one or two most urgent issues.
+    decision_options:
+    - APPROVE
+    - REJECT
+    produces:
+    - review_decision
+    key_data:
+    - title: 'Zomato: store performance'
+      views:
+      - view: table
+        from: zomato_findings
+        columns: *id001
+    - title: 'Zomato: marketing effectiveness'
+      views:
+      - view: table
+        from: marketing_findings
+        columns: *id002
+    - title: 'Swiggy and other channels: store performance'
+      views:
+      - view: table
+        from: swiggy_findings
+        columns: *id003
+    - title: Product performance
+      views:
+      - view: table
+        from: product_findings
+        columns: *id004
+  - id: send_weekly_brief
+    name: Send weekly sales brief
+    type: notify
+    after:
+    - sales_head_review
+    description: On approval, send the weekly sales brief (Genzoic HTML email via the Genzoic Email Formatter
+      skill).
+    condition: '{{review_decision}} == "APPROVE"'
+    produces:
+    - summary_sent
+    action:
+      type: skill
+      name: email_sales_gap_summary
+      config:
+        type: skill
+        skill: genzoic-email-formatter
+        operation: send
+        args:
+          to: kaashvij06@gmail.com
+          subject: 'Weekly sales brief: Zomato, Swiggy, products and Zomato marketing'
+          title: Weekly Sales Brief
+          intro: 'Zomato stores: {{zomato_summary}} Zomato marketing: {{marketing_summary}} Swiggy and
+            other channels: {{swiggy_summary}} Products: {{product_summary}}'
+          sections:
+          - type: table
+            caption: 'Zomato: store performance'
+            columns: *id001
+            records: '{{zomato_findings}}'
+          - type: table
+            caption: 'Zomato: marketing effectiveness'
+            columns: *id002
+            records: '{{marketing_findings}}'
+          - type: table
+            caption: 'Swiggy and other channels: store performance'
+            columns: *id003
+            records: '{{swiggy_findings}}'
+          - type: table
+            caption: Product performance
+            columns: *id004
+            records: '{{product_findings}}'
+          footer_note: 'Generated automatically by the Sales Gap Diagnosis process. Latest sales week
+            vs the week before and the 4-week baseline, on matched weekdays. Marketing is Zomato only.
+            Not in the data yet, so not considered: kitchen prep time (KPT), store online availability,
+            order cancellations, inventory, Swiggy marketing, competitor pricing.'
+  metadata:
+    tools:
+      skills: []
+    version: 2
+    priority: 10
+    policy_rules:
+    - 'The data is raw: the views do not flag, score or explain anything. Each diagnose step reads every
+      row of its view and decides for itself what moved and why. *_CUR is the latest week, *_PREV the
+      week before and *_BASE the 4-week average, already scaled to the same number of days.'
+    - 'Don''t make anything up, especially numbers: only use figures that are in the rows, or simple arithmetic
+      on them, and show the figures used. Only cite causes the rows show.'
+    - 'Explain in plain business language: whether a move came from fewer orders or smaller baskets, and
+      whether the likely cause is demand-side (marketing, visibility, occasions, weather) or supply/ops-side
+      (complaints, rating), or a mix. Point out patterns across stores or products, and say when evidence
+      is thin (e.g. a rating from one review).'
+    - 'Data caveats: DAYS_CUR is how many of the latest 7 days loaded (the sales feed has missing days,
+      so comparisons use matched weekdays). Marketing is Zomato only and runs on its own week (MKT_WEEK_END,
+      MKT_DAYS_CUR). Product complaints are only linked to products from Jul 2026. Not in the data, so
+      never a cause: kitchen prep time (KPT), store online availability, cancellations, inventory, Swiggy
+      marketing, competitor pricing.'
+    effective_from: '2026-09-29'
+    context_package:
+    - key: scheduled_at
+      source: event
+      required: false
+    run_steps_before_gate: true
+    requires_human_approval: true
