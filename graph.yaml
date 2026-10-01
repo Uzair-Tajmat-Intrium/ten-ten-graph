@@ -14,18 +14,20 @@ ontology:
     relationships: relationships.yaml
 
 # Controlled vocabularies and hierarchies.
-# Org chart, KPIs, goals and policies are intentionally absent — the seeded
-# versions were demo data and were removed; real ones land here as the customer
-# supplies them.
+# Org chart and policies are intentionally absent — the seeded versions were
+# demo data and were removed; real ones land here as the customer supplies them.
+# KPIs and goals: the sales-health set behind processes/sales_gap_diagnosis.yaml.
 master_data:
   dir: ./master_data
   files:
     vocabularies: vocabularies.yaml
     hierarchies:  hierarchies.yaml
+    kpis:         kpis.yaml
+    goals:        goals.yaml
   cache_dir: .contextgraph/refdata_cache
 
 # Operational workflows: inventory optimization, label compliance review,
-# idea capture & triage, shelf-life risk monitoring.
+# shelf-life risk monitoring, sales gap diagnosis.
 processes:
   dir: ./processes
 
