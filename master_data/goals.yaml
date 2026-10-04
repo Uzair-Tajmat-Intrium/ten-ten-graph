@@ -20,7 +20,7 @@ goals:
     description: Sell more without wasting stock or shipping non-compliant labels.
     horizon: FY26
     owner: executive_leadership
-    contributors: [supply_chain_team, demand_planning_team, compliance_team, portfolio_team]
+    contributors: [supply_chain_team, demand_planning_team, compliance_team, portfolio_team, sales_team, marketing_team, cx_team]
 
   # --- business areas -------------------------------------------------------
   - id: reduce_stock_wastage
@@ -97,3 +97,43 @@ goals:
       - { kpi: portfolio_gross_margin_pct, aggregation: avg, cadence: Monthly }
       - { kpi: average_cogs,               aggregation: avg, cadence: Monthly }
       - { kpi: max_shelf_life,             aggregation: max, cadence: Monthly }
+
+  # --- sales (processes/sales_gap_diagnosis.yaml) ---------------------------
+  # No `kpis` here on purpose: the sales KPIs are published from
+  # semantic_models/sales_gap_semantic_model.osi.yaml and linked to these goals in the UI.
+  - id: grow_weekly_sales
+    parent: grow_profitably
+    name: Grow weekly sales
+    kind: strategic
+    description: >-
+      Keep sales, orders and basket size growing across every channel, store and product,
+      and catch a dip early enough to fix its cause.
+    horizon: FY26
+    owner: sales_team
+    contributors: [marketing_team, demand_planning_team, cx_team]
+    applies_to: [Store]
+    processes: [sales_gap_diagnosis]
+
+  - id: spend_marketing_where_it_returns
+    parent: grow_weekly_sales
+    name: Spend marketing where it returns
+    kind: operational
+    description: >-
+      Keep Zomato ad spend earning at least twice its cost, and cut or move spend that
+      does not. Swiggy ads are not integrated yet.
+    horizon: FY26
+    owner: marketing_team
+    applies_to: [Store]
+    processes: [sales_gap_diagnosis]
+
+  - id: keep_customers_happy
+    parent: grow_weekly_sales
+    name: Keep customers happy
+    kind: operational
+    description: >-
+      Hold complaints down and ratings up, so a quality or delivery problem does not turn
+      into lost orders.
+    horizon: FY26
+    owner: cx_team
+    applies_to: [Store]
+    processes: [sales_gap_diagnosis]

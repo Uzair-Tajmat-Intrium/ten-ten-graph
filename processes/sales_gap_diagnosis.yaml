@@ -1,0 +1,308 @@
+# Sales Gap Diagnosis: weekly look at why sales moved - one merged store step (Zomato, Swiggy and
+# other channels, with the Zomato marketing funnel), a Zomato marketing deep dive, and product
+# performance - then a review gate and an email on approval.
+# Data: RAW views in sql/views.sql. The store step reads V_SALES_GAP_STORE_BRIEF (built from
+# V_SALES_GAP_STORE + V_SALES_GAP_ZOMATO_MKT, values packed into labelled text) so every mover
+# fits in one fetch: a step sees only ~9000 chars of its own fetch. Its question returns only the
+# stores that moved >= 15% vs the baseline (baseline >= Rs 2,000), biggest rupee change first.
+# Marketing reads V_SALES_GAP_ZOMATO_MKT, products V_SALES_GAP_PRODUCT.
+# Each fetch reads its view through semantic_models/sales_gap_semantic_model.osi.yaml (datasets
+# store_brief, product_week, zomato_marketing_week): the question names the exact columns, filter
+# and order, and the server writes the SELECT from the model. The model must be registered and
+# configured on the tenant.
+# Unmapped items (hampers, gift boxes; SKU_ID 'UNKNOWN') are filtered out here, not in the view.
+version: 1
+processes:
+- id: sales_gap_diagnosis
+  name: Sales Gap Diagnosis
+  description: |
+    Weekly look at why sales moved: one table of every store that moved on Zomato, Swiggy or other channels, with the Zomato marketing funnel alongside and the patterns across stores; a Zomato marketing deep dive; and every product. The views hold raw numbers only (latest week, the week before and the 4-week baseline); the agent decides why. On approval, the brief is emailed to the sales, ops and marketing owners.
+  domain: Sales
+  owner: sales_team
+  applies_to:
+  - entity: Store
+  - entity: Store
+    where:
+    - op: ne
+      field: id
+      value: __none__
+  triggers:
+  - type: schedule
+    cron: 0 8 * * 1
+  - type: event
+    event_type: sales_gap_diagnosis
+  - type: manual
+    allowed_roles:
+    - DemandPlanner
+    - SalesManager
+  inputs:
+  - name: store_id
+    type: reference
+    references: Store
+  - name: scheduled_at
+    type: datetime
+  outputs:
+  - name: decision
+    type: enum
+    values:
+    - APPROVE
+    - REJECT
+  - name: store_findings
+    type: object
+  - name: product_findings
+    type: object
+  - name: marketing_findings
+    type: object
+  steps:
+  - id: zomato_marketing_effectiveness
+    name: 'Zomato: marketing effectiveness'
+    type: agent
+    description: 'Whether Zomato ad spend is working: spend, visibility, clicks, conversion and ROI by
+      store, this week vs last.'
+    fetch:
+      source: semantic_model
+      model_id: sales_gap_semantic_model
+      question: 'Return exactly these columns of zomato_marketing_week, unchanged, one row per zomato_marketing_week
+        row, no aggregation, no joins: STORE_NAME, CAMPAIGNS, AD_TYPE, TARGETING, SEGMENTS, SPEND_DAY_CUR,
+        SPEND_DAY_PREV, ROI_CUR, ROI_PREV, BUDGET_USED_CUR, BUDGET_USED_PREV, AD_ORD_DAY_CUR, AD_ORD_DAY_PREV,
+        ADS_CTR_CUR, ADS_CTR_PREV, ADS_M2O_CUR, ADS_M2O_PREV, IMPR_DAY_CUR, IMPR_DAY_PREV, ORD_DAY_CUR,
+        ORD_DAY_PREV, CTR_CUR, CTR_PREV, M2O_CUR, M2O_PREV. Order by SPEND_DAY_CUR desc.'
+      limit: 50
+      required: true
+      as: marketing_input
+    instruction: |
+      Evaluate how well Zomato ad spend turned into orders and revenue at each store this marketing week vs last.
+      - Review spend per day, budget used, impressions, click-through, ad and store conversion, and ROI.
+      - Focus on stores where spend, ROI or conversion (M2O) changed by 15% or more; skip stores spending under Rs 100 a day. Rank by spend per day this week, largest first.
+      - Give each store's campaign a verdict: SCALE (strong return, worth more budget), KEEP (steady), FIX (funnel or targeting underperforming) or CUT (spend not returning).
+      - Recommend the campaign adjustment for each.
+      - Use only figures from the rows or simple arithmetic on them. Do not invent numbers or causes.
+
+      Data: `marketing_input`, one row per Zomato store plus "All stores", with this week's campaign (AD_TYPE, TARGETING, SEGMENTS). _CUR = this marketing week, _PREV = last week; _DAY values are per day. ROI = ad sales / spend; BUDGET_USED = spend / booked budget, %; ADS_ = ad funnel, the rest = whole restaurant; CTR = clicks / impressions, %; M2O = orders / menu opens, %.
+      Return inside "outputs": marketing_findings, a list of objects with exactly these keys: rank, store, campaign, segments, targeting, spend_per_day, budget_used, roi, impressions_per_day, ad_conversion, store_conversion, orders_per_day, verdict, likely_reason, action. Formats: campaign, segments and targeting from AD_TYPE, SEGMENTS and TARGETING; spend_per_day (Rs), budget_used (%), roi, impressions_per_day, ad_conversion (ADS_M2O %), store_conversion (M2O %) and orders_per_day each "last week -> this week"; verdict SCALE, KEEP, FIX or CUT; likely_reason one sentence with the figures; action one next step. And marketing_summary: a Markdown string with real line breaks (\n) between lines, following this template exactly. Section headers use ###, never a bullet. Each bullet is one line: headline, then the supporting numbers, then a short takeaway after a dash. Bold only store or product names, key metrics and the key finding. No repeated figures, no filler words. Leave out a section with nothing in it. Template: **<one-line headline>**\n\n### Overall\n- Spend **<last -> this week>**/day, ROI **<last -> this week>**, M2O **<last -> this week>** - <takeaway>\n\n### Scale\n- **<store>**: <numbers> - <takeaway>\n\n### Fix\n- **<store>**: <numbers> - <takeaway>\n\n### Cut\n- **<store>**: <numbers> - <takeaway>. Up to three stores per section. And marketing_verdicts: one plain line with every store in marketing_findings as "Store: VERDICT", separated by "; ", e.g. "Khar: SCALE; Fort: CUT".
+    produces:
+    - marketing_findings
+    - marketing_summary
+    - marketing_verdicts
+    key_data:
+    - title: 'Zomato: marketing effectiveness'
+      views:
+      - view: table
+        from: marketing_findings
+        columns:
+        - rank
+        - store
+        - campaign
+        - segments
+        - targeting
+        - spend_per_day
+        - budget_used
+        - roi
+        - impressions_per_day
+        - ad_conversion
+        - store_conversion
+        - orders_per_day
+        - verdict
+        - likely_reason
+        - action
+    - title: Marketing summary
+      views:
+      - view: markdown
+        from: marketing_summary
+  - id: store_performance
+    name: 'Store performance: Zomato, Swiggy and other channels'
+    type: agent
+    description: Every store whose sales moved this week, on Zomato, Swiggy or other channels, in one
+      table with the Zomato marketing funnel alongside, plus the patterns across stores.
+    fetch:
+      source: semantic_model
+      model_id: sales_gap_semantic_model
+      question: 'Return exactly these columns of store_brief, unchanged, one row per store_brief row,
+        no aggregation, no joins: STORE, CH, SALES, ORDERS, AOV, CX, RAIN, OCC, MKT. Only rows where SALES_BASE
+        >= 2000 AND ABS(SALES_CUR - SALES_BASE) >= 0.15 * SALES_BASE. Order by ABS(SALES_CUR - SALES_BASE)
+        desc.'
+      limit: 60
+      required: true
+      as: store_rows
+    instruction: |
+      Analyse this week's sales for every store that moved, on Zomato, Swiggy and other channels, against last week and the 4-week baseline.
+      - The rows are already the stores whose sales moved 15% or more vs the baseline (baseline of Rs 2,000 or more), largest rupee change first; keep that order as the rank.
+      - Diagnose what drove each move: fewer orders, a smaller basket (AOV), or both.
+      - Explain the cause from the row (Zomato marketing funnel, complaints, rating and reviews, rain days, occasions) and say whether it is demand-side or operational.
+      - Give one clear next step and the accountable team. Where the marketing verdict or the Zomato marketing figures explain the move, make it a marketing action (budget, campaign or targeting).
+      - Look across the stores for patterns: group stores that moved for the same reason, and pair a store that went down with one that went up (the same store on the other channel, or a comparable store) and say what differs between them.
+      - Use only figures from the rows or simple arithmetic on them. Do not invent numbers or causes.
+
+      Data: `store_rows`, one row per store and channel (CH: Zomato, Swiggy or Other); "All stores" rows are the network total per channel. SALES and ORDERS read "base / last / now" = 4-week average, last week, this week, all on the same number of trading days. AOV, RAIN and OCC read last week -> this week. CX: complaints last week -> this week, this week's rating and reviews; complaints are per store across channels, so do not add them up across a store's channels. MKT: the Zomato campaign type and funnel (spend/day, ROI, store M2O, ad M2O, budget used %, impressions/day), latest marketing week vs the one before. `marketing_verdicts` (from the marketing step) gives each Zomato store's campaign verdict: SCALE, KEEP, FIX or CUT.
+      Return inside "outputs": store_findings, a list of objects with exactly these keys: rank, store, channel, trend, sales_baseline, sales_last_week, sales_this_week, change_vs_baseline, orders, aov, driven_by, zomato_marketing, marketing_verdict, swiggy_marketing, cause_type, likely_reason, action, owner. Formats: channel Zomato, Swiggy or Other; trend UP, DOWN or FLAT; sales_ values in whole rupees as a plain number, e.g. 12301; change_vs_baseline e.g. "-41.1%"; orders "baseline -> this week"; aov "last week -> this week"; driven_by ORDERS, BASKET SIZE or BOTH; zomato_marketing one line of the relevant Zomato figures, last week -> this week, or "-" on non-Zomato rows; marketing_verdict the store's verdict from marketing_verdicts on Zomato rows, "-" if it has none or on non-Zomato rows; swiggy_marketing "No Swiggy marketing data" on Swiggy rows, "-" otherwise; cause_type DEMAND, SUPPLY_OPS, MIXED or UNKNOWN; likely_reason one sentence with the figures; action one next step; owner Marketing, Store ops, CX or Category. And network_summary: a Markdown string with real line breaks (\n) between lines, following this template exactly. Section headers use ###, never a bullet. Each bullet is one line: headline, then the supporting numbers, then a short takeaway after a dash. Bold only store or product names, key metrics and the key finding. No repeated figures, no filler words. Leave out a section with nothing in it. Template: **<one-line headline of the week>**\n\n### Overall\n- **Zomato**: sales **<change>%** vs baseline (<baseline> -> <this week>) - <takeaway>\n- **Swiggy**: sales **<change>%** vs baseline (<baseline> -> <this week>) - <takeaway>\n\n### Patterns\n- **<pattern, e.g. Zomato funnel collapse>**: **<store>**, **<store>** - <key numbers> - <takeaway>\n\n### Down vs up\n- **<store> <channel> down** vs **<store> <channel> up**: <numbers for each> - <what differs>\n\n### Priorities\n- <Verb> <action> at **<stores>** (<owner>). Up to four bullets per section.
+    produces:
+    - store_findings
+    - network_summary
+    key_data:
+    - &id002
+      title: 'Stores: Zomato, Swiggy and other channels'
+      views:
+      - view: table
+        from: store_findings
+        columns: &id005
+        - rank
+        - store
+        - channel
+        - trend
+        - sales_baseline
+        - sales_last_week
+        - sales_this_week
+        - change_vs_baseline
+        - orders
+        - aov
+        - driven_by
+        - zomato_marketing
+        - marketing_verdict
+        - swiggy_marketing
+        - cause_type
+        - likely_reason
+        - action
+        - owner
+    - &id001
+      title: Network summary
+      views:
+      - view: markdown
+        from: network_summary
+    after:
+    - zomato_marketing_effectiveness
+  - id: product_performance
+    name: Product performance
+    type: agent
+    after:
+    - store_performance
+    description: Which products gained or lost sales and units across all stores and channels, and why.
+    fetch:
+      source: semantic_model
+      model_id: sales_gap_semantic_model
+      question: 'Return exactly these columns of product_week, unchanged, one row per product_week row,
+        no aggregation, no joins: ITEM_NAME, SALES_CUR, SALES_PREV, SALES_BASE, UNITS_CUR, UNITS_PREV,
+        UNITS_BASE, COMPLAINTS_CUR, COMPLAINTS_PREV. Only rows where SKU_ID <> ''UNKNOWN''. Order by SALES_BASE
+        desc.'
+      limit: 100
+      required: true
+      as: product_input
+    instruction: |
+      Identify the biggest gaining and declining products network-wide this week against the 4-week baseline.
+      - Focus on products whose sales moved 15% or more vs the baseline, up or down; skip products with a baseline under Rs 1,000. Rank by rupee change vs the baseline, largest first, gains and losses together.
+      - Determine whether each move came from unit volume or from a complaint spike on the product.
+      - Diagnose the likely cause only as far as units and complaints show it (a demand shift or a quality issue), and recommend a category or kitchen action.
+      - Use only figures from the rows or simple arithmetic on them. Do not invent numbers or causes.
+
+      Data: `product_input`, one row per product across all stores and channels. _CUR = this week, _PREV = last week, _BASE = 4-week average, all on the same number of days. UNITS = quantity sold; COMPLAINTS = complaints linked to the product through the order.
+      Return inside "outputs": product_findings, a list of objects with exactly these keys: rank, product, trend, sales_baseline, sales_this_week, change_vs_baseline, units, complaints, cause_type, likely_reason, action, owner. Formats: trend UP, DOWN or FLAT; sales_ values in whole rupees as a plain number, e.g. 12301; change_vs_baseline e.g. "-41.1%"; units "baseline -> this week"; complaints "last week -> this week"; cause_type DEMAND, SUPPLY_OPS, MIXED or UNKNOWN; likely_reason one sentence with the figures; action one next step; owner Marketing, Store ops, CX or Category. And product_summary: a Markdown string with real line breaks (\n) between lines, following this template exactly. Section headers use ###, never a bullet. Each bullet is one line: headline, then the supporting numbers, then a short takeaway after a dash. Bold only store or product names, key metrics and the key finding. No repeated figures, no filler words. Leave out a section with nothing in it. Template: **<one-line headline>**\n\n### Overall\n- **<n> products** moved 15% or more vs baseline - <takeaway>\n\n### Biggest declines\n- **<product>**: **-Rs <change>** (<units baseline -> this week>) - <takeaway>\n\n### Biggest gains\n- **<product>**: **+Rs <change>** (<units baseline -> this week>) - <takeaway>\n\n### Driver\n- <units or complaints, with the numbers>\n\n### Priorities\n- <Verb> <action> for **<products>** (<owner>). Up to three products per section.
+    produces:
+    - product_findings
+    - product_summary
+    key_data:
+    - &id004
+      title: Product performance
+      views:
+      - view: table
+        from: product_findings
+        columns: &id006
+        - rank
+        - product
+        - trend
+        - sales_baseline
+        - sales_this_week
+        - change_vs_baseline
+        - units
+        - complaints
+        - cause_type
+        - likely_reason
+        - action
+        - owner
+    - &id003
+      title: Product summary
+      views:
+      - view: markdown
+        from: product_summary
+  - id: sales_head_review
+    name: Sales head review
+    type: decision
+    after:
+    - product_performance
+    description: The sales head reviews the week's findings and approves sending the brief to sales, ops
+      and marketing, or holds it.
+    instruction: |
+      Review this week's network summary, the store table (Zomato, Swiggy and other channels, with Zomato marketing) and the product table.
+      - Recommend APPROVE to send the weekly brief to sales, ops and marketing leadership, or REJECT if nothing moved beyond normal variation.
+      - Name the one or two most critical issues leadership should act on first.
+    decision_options:
+    - APPROVE
+    - REJECT
+    produces:
+    - review_decision
+    key_data:
+    - *id001
+    - *id002
+    - *id003
+    - *id004
+  - id: send_weekly_brief
+    name: Send weekly sales brief
+    type: notify
+    after:
+    - sales_head_review
+    description: On approval, send the weekly sales brief (Genzoic HTML email via the Genzoic Email Formatter
+      skill).
+    condition: '{{review_decision}} == "APPROVE"'
+    produces:
+    - summary_sent
+    action:
+      type: skill
+      name: email_sales_gap_summary
+      config:
+        type: skill
+        skill: genzoic-email-formatter
+        operation: send
+        args:
+          to: kaashvij06@gmail.com
+          subject: 'Weekly sales brief: stores, channels and products'
+          title: Weekly Sales Brief
+          intro: '{{network_summary}} Products: {{product_summary}}'
+          sections:
+          - type: table
+            caption: 'Stores: Zomato, Swiggy and other channels'
+            columns: *id005
+            records: '{{store_findings}}'
+          - type: table
+            caption: Product performance
+            columns: *id006
+            records: '{{product_findings}}'
+          footer_note: 'Generated automatically by the Sales Gap Diagnosis process. Latest sales week
+            vs the week before and the 4-week baseline, on matched weekdays. Marketing is Zomato only.
+            Not in the data yet, so not considered: kitchen prep time (KPT), store online availability,
+            order cancellations, inventory, Swiggy marketing, competitor pricing.'
+    instruction: null
+  metadata:
+    tools:
+      skills: []
+    version: 2
+    priority: 10
+    policy_rules:
+    - 'The data is raw: the views do not flag, score or explain anything. Each diagnose step reads every
+      row of its view and decides for itself what moved and why. *_CUR is the latest week, *_PREV the
+      week before and *_BASE the 4-week average, already scaled to the same number of days.'
+    - 'Don''t make anything up, especially numbers: only use figures that are in the rows, or simple arithmetic
+      on them, and show the figures used. Only cite causes the rows show.'
+    - 'Explain in plain business language: whether a move came from fewer orders or smaller baskets, and
+      whether the likely cause is demand-side (marketing, visibility, occasions, weather) or supply/ops-side
+      (complaints, rating), or a mix. Point out patterns across stores or products, and say when evidence
+      is thin (e.g. a rating from one review).'
+    - 'Data caveats: DAYS_CUR is how many of the latest 7 days loaded (the sales feed has missing days,
+      so comparisons use matched weekdays). Marketing is Zomato only and runs on its own week (MKT_WEEK_END,
+      MKT_DAYS_CUR). Product complaints are only linked to products from Jul 2026. Not in the data, so
+      never a cause: kitchen prep time (KPT), store online availability, cancellations, inventory, Swiggy
+      marketing, competitor pricing.'
+    effective_from: '2026-09-29'
+    context_package:
+    - key: scheduled_at
+      source: event
+      required: false
+    run_steps_before_gate: true
+    requires_human_approval: true
