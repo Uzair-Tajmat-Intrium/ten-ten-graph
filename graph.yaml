@@ -15,7 +15,9 @@ ontology:
 
 # Controlled vocabularies, hierarchies, KPIs and goals. KPI formulas live in the
 # OSI semantic models (semantic_models/*.osi.yaml, uploaded via Connections);
-# kpis.yaml only adds targets. Org chart and policies are still absent.
+# kpis.yaml only adds targets. The sales-gap KPIs are published straight from
+# semantic_models/sales_gap_semantic_model.osi.yaml and linked to their goals in the UI.
+# Org chart and policies are still absent.
 master_data:
   dir: ./master_data
   files:
@@ -25,8 +27,8 @@ master_data:
     goals:        goals.yaml
   cache_dir: .contextgraph/refdata_cache
 
-# Operational workflows: inventory optimization, label compliance review and
-# shelf-life risk monitoring.
+# Operational workflows: inventory optimization, label compliance review,
+# shelf-life risk monitoring and sales gap diagnosis.
 processes:
   dir: ./processes
 

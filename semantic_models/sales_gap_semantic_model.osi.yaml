@@ -1,0 +1,532 @@
+version: "1.0"
+name: sales_gap_semantic_model
+description: "Sales Gap Diagnosis semantic model. It reads the sales-gap views (merged store brief, store x channel, product, Zomato marketing), which do the week maths, and publishes network KPIs from their All stores rows: daily sales, daily orders, AOV, sales and Zomato sales vs baseline, weekly complaints, Zomato ROAS, budget used and menu-to-order conversion, and products down vs baseline, plus the 30-day store rating from raw reviews. The process reads the views through this model."
+
+# Register notes (context-graph):
+#   * The views do the maths a metric cannot: anchor on the latest LOADED date (not today),
+#     weekday-match and scale last week / the 4-week baseline, marketing per loaded day. The
+#     model describes their columns and reads KPIs off their 'All stores' rows (MASTER_STORE_ID
+#     'ALL'), so KPI values equal what the process sees. SQL: sql/views.sql.
+#   * Only dim_store has a primary_key and is bound to Store. Never bind the views: their 'ALL'
+#     rows would become a fake Store and store_week has one row per channel. Publish their
+#     metrics as KPIs (configure) instead.
+#   * Published KPIs are one network value each (the platform does not split them per store).
+#   * Field NAMES are the physical column names. Metric expressions: one dataset each, no
+#     AND / OR (nested CASE instead).
+
+datasets:
+  - name: dim_store
+    description: "Dark stores: one row per store."
+    source: "gen-lang-client-0520145261.bronze.MASTER_STORE"
+    primary_key: [MASTER_STORE_ID]
+    fields:
+      - name: MASTER_STORE_ID
+        description: "Store id"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: MASTER_STORE_ID
+      - name: STORE_NAME
+        description: "Store name"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: STORE_NAME
+      - name: CITY
+        description: "City"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: CITY
+
+  - name: store_week
+    description: "V_SALES_GAP_STORE: this week's sales per store x channel, plus an 'All stores' row per channel, with the store's Zomato marketing headline, complaints, reviews, weather and occasions. _CUR = this week (the 7 days to WEEK_END); _PREV = last week and _BASE = the 4-week average, both weekday-matched and scaled to DAYS_CUR days so all three compare directly. Marketing columns use their own, later-lagging marketing week."
+    source: "gen-lang-client-0520145261.bronze.V_SALES_GAP_STORE"
+    fields:
+      - name: MASTER_STORE_ID
+        description: "Store id; 'ALL' on the 'All stores' total row of each channel"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: MASTER_STORE_ID
+      - name: CHANNEL
+        description: "Sales channel: Zomato, Swiggy (incl. Toing by Swiggy) or Other (POS etc.)"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: CHANNEL
+      - name: DAYS_CUR
+        description: "Days with sales data this week (the feed has whole-day gaps)"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: DAYS_CUR
+      - name: SALES_CUR
+        description: "Gross item sales this week, Rs (UNIT_PRICE x QUANTITY, before discounts)"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SALES_CUR
+      - name: SALES_BASE
+        description: "Gross item sales, 4-week average, Rs, scaled to DAYS_CUR days"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SALES_BASE
+      - name: ORDERS_CUR
+        description: "Distinct orders this week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ORDERS_CUR
+      - name: COMPLAINTS_CUR
+        description: "Store-level: distinct complained orders this week, all platforms (same on each channel row; do not add across channels)"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: COMPLAINTS_CUR
+
+  - name: store_brief
+    description: "V_SALES_GAP_STORE_BRIEF: the merged store table - one row per store x channel plus an 'All stores' row per channel, built from V_SALES_GAP_STORE and V_SALES_GAP_ZOMATO_MKT with values packed into labelled text so every mover fits in one step input. SALES_CUR and SALES_BASE are numbers for filtering and sorting; the rest is text."
+    source: "gen-lang-client-0520145261.bronze.V_SALES_GAP_STORE_BRIEF"
+    fields:
+      - name: MASTER_STORE_ID
+        description: "Store id; 'ALL' on the 'All stores' total row of each channel"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: MASTER_STORE_ID
+      - name: STORE
+        description: "Store name; 'All stores' on the total rows"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: STORE
+      - name: CH
+        description: "Sales channel: Zomato, Swiggy (incl. Toing by Swiggy) or Other (POS etc.)"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: CH
+      - name: WEEK_END
+        description: "Last day of this week = latest loaded sales date"
+        dimension:
+          is_time: true
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: WEEK_END
+      - name: SALES_CUR
+        description: "Gross item sales this week, Rs (number; for filtering and sorting)"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SALES_CUR
+      - name: SALES_BASE
+        description: "Gross item sales, 4-week average scaled to this week's trading days, Rs (number; for filtering and sorting)"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SALES_BASE
+      - name: SALES
+        description: "Text 'base X / last Y / now Z': gross item sales, Rs - 4-week average, last week, this week, on the same trading days"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SALES
+      - name: ORDERS
+        description: "Text 'base X / last Y / now Z': distinct orders - 4-week average, last week, this week, on the same trading days"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ORDERS
+      - name: AOV
+        description: "Text 'last -> now': average order value, Rs, last week -> this week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: AOV
+      - name: CX
+        description: "Text: complaints last week -> this week, this week's average rating and review count (store-level, same on each channel row)"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: CX
+      - name: RAIN
+        description: "Text 'last -> now': rainy days, last week -> this week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: RAIN
+      - name: OCC
+        description: "Text 'last -> now': holidays and occasions, last week -> this week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: OCC
+      - name: MKT
+        description: "Text: on Zomato rows the campaign type and funnel (spend/day, ROI, store M2O, ad M2O, budget used %, impressions/day), latest marketing week vs the one before; 'No Swiggy marketing data' on Swiggy rows; 'No marketing data' on Other rows"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: MKT
+
+  - name: product_week
+    description: "V_SALES_GAP_PRODUCT: this week's sales and units per product across all stores and channels, with product complaints. _CUR = this week (the 7 days to WEEK_END); _PREV = last week and _BASE = the 4-week average, both weekday-matched and scaled to DAYS_CUR days so all three compare directly."
+    source: "gen-lang-client-0520145261.bronze.V_SALES_GAP_PRODUCT"
+    fields:
+      - name: SKU_ID
+        description: "Product SKU; 'UNKNOWN' for unmapped items (hampers, gift boxes), one row per item name"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SKU_ID
+      - name: ITEM_NAME
+        description: "Product name"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ITEM_NAME
+      - name: SALES_CUR
+        description: "Gross sales this week across all stores and channels, Rs"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SALES_CUR
+      - name: SALES_PREV
+        description: "Gross sales last week, Rs, scaled to DAYS_CUR days"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SALES_PREV
+      - name: SALES_BASE
+        description: "Gross sales, 4-week average, Rs, scaled to DAYS_CUR days"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SALES_BASE
+      - name: UNITS_CUR
+        description: "Units sold this week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: UNITS_CUR
+      - name: UNITS_PREV
+        description: "Units sold last week, scaled to DAYS_CUR days"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: UNITS_PREV
+      - name: UNITS_BASE
+        description: "Units sold, 4-week average, scaled to DAYS_CUR days"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: UNITS_BASE
+      - name: COMPLAINTS_CUR
+        description: "Complained orders containing this product this week (linked via order id, from Jul 2026)"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: COMPLAINTS_CUR
+      - name: COMPLAINTS_PREV
+        description: "Complained orders containing this product last week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: COMPLAINTS_PREV
+
+  - name: zomato_marketing_week
+    description: "V_SALES_GAP_ZOMATO_MKT: the full Zomato marketing funnel per store plus an 'All stores' row, this marketing week (_CUR, the 7 days to MKT_WEEK_END) vs last (_PREV). _DAY values are per loaded day; ratios are recomputed from sums. ADS_ = ad funnel, the rest = whole restaurant."
+    source: "gen-lang-client-0520145261.bronze.V_SALES_GAP_ZOMATO_MKT"
+    fields:
+      - name: MASTER_STORE_ID
+        description: "Store id; 'ALL' on the 'All stores' total row"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: MASTER_STORE_ID
+      - name: STORE_NAME
+        description: "Store name; 'All stores' on the total row"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: STORE_NAME
+      - name: CAMPAIGNS
+        description: "Campaigns running this week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: CAMPAIGNS
+      - name: AD_TYPE
+        description: "Ad types running this week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: AD_TYPE
+      - name: TARGETING
+        description: "Campaign targeting this week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: TARGETING
+      - name: SEGMENTS
+        description: "Customer segments targeted this week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SEGMENTS
+      - name: SPEND_DAY_CUR
+        description: "Zomato ad spend per day, Rs, this marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SPEND_DAY_CUR
+      - name: SPEND_DAY_PREV
+        description: "Zomato ad spend per day, Rs, last marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SPEND_DAY_PREV
+      - name: ROI_CUR
+        description: "Zomato ad sales / ad spend, this marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ROI_CUR
+      - name: ROI_PREV
+        description: "Zomato ad sales / ad spend, last marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ROI_PREV
+      - name: BUDGET_USED_CUR
+        description: "Zomato ad spend / booked budget, %, this marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: BUDGET_USED_CUR
+      - name: BUDGET_USED_PREV
+        description: "Zomato ad spend / booked budget, %, last marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: BUDGET_USED_PREV
+      - name: AD_ORD_DAY_CUR
+        description: "Zomato ad orders per day, this marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: AD_ORD_DAY_CUR
+      - name: AD_ORD_DAY_PREV
+        description: "Zomato ad orders per day, last marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: AD_ORD_DAY_PREV
+      - name: ADS_CTR_CUR
+        description: "Zomato ad clicks / ad impressions, %, this marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ADS_CTR_CUR
+      - name: ADS_CTR_PREV
+        description: "Zomato ad clicks / ad impressions, %, last marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ADS_CTR_PREV
+      - name: ADS_M2O_CUR
+        description: "Zomato ad orders / ad menu opens, %, this marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ADS_M2O_CUR
+      - name: ADS_M2O_PREV
+        description: "Zomato ad orders / ad menu opens, %, last marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ADS_M2O_PREV
+      - name: IMPR_DAY_CUR
+        description: "Zomato all impressions per day, this marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: IMPR_DAY_CUR
+      - name: IMPR_DAY_PREV
+        description: "Zomato all impressions per day, last marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: IMPR_DAY_PREV
+      - name: ORD_DAY_CUR
+        description: "Zomato all Zomato orders per day, this marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ORD_DAY_CUR
+      - name: ORD_DAY_PREV
+        description: "Zomato all Zomato orders per day, last marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: ORD_DAY_PREV
+      - name: CTR_CUR
+        description: "Zomato menu opens / impressions, %, this marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: CTR_CUR
+      - name: CTR_PREV
+        description: "Zomato menu opens / impressions, %, last marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: CTR_PREV
+      - name: M2O_CUR
+        description: "Zomato orders / menu opens, %, this marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: M2O_CUR
+      - name: M2O_PREV
+        description: "Zomato orders / menu opens, %, last marketing week"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: M2O_PREV
+
+  - name: customer_reviews
+    description: "Raw customer reviews with star rating per store (Zomato), for the 30-day rating KPI."
+    source: "gen-lang-client-0520145261.bronze.CUSTOMER_REVIEW_EVENTS"
+    fields:
+      - name: REVIEW_ID
+        description: "Review id"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: REVIEW_ID
+      - name: MASTER_STORE_ID
+        description: "Store"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: MASTER_STORE_ID
+      - name: STAR_RATING
+        description: "Star rating, 1 to 5"
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: STAR_RATING
+      - name: REVIEW_DATE
+        description: "Review date"
+        dimension:
+          is_time: true
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: REVIEW_DATE
+
+metrics:
+  - name: daily_gross_sales
+    description: "Average gross item sales per trading day this week, all channels (Rs, before discounts). Network total from the view's 'All stores' rows, this week (WEEK_END). Target >= 50,000. Higher is better."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "ROUND(SUM(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN store_week.SALES_CUR ELSE 0 END) / NULLIF(MAX(store_week.DAYS_CUR), 0), 0)"
+
+  - name: daily_orders
+    description: "Average orders per trading day this week, all channels. Network total from the view's 'All stores' rows, this week (WEEK_END). Target >= 65. Higher is better."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "ROUND(SUM(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN store_week.ORDERS_CUR ELSE 0 END) / NULLIF(MAX(store_week.DAYS_CUR), 0), 1)"
+
+  - name: average_order_value
+    description: "Gross item sales / orders this week, all channels (Rs). Network total from the view's 'All stores' rows, this week (WEEK_END). Target >= 750. Higher is better."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "ROUND(SUM(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN store_week.SALES_CUR ELSE 0 END) / NULLIF(SUM(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN store_week.ORDERS_CUR ELSE 0 END), 0), 0)"
+
+  - name: sales_vs_baseline_pct
+    description: "Sales this week vs the 4-week average on the same days, all channels, %. Network total from the view's 'All stores' rows, this week (WEEK_END). Higher is better."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "ROUND((SUM(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN store_week.SALES_CUR ELSE 0 END) - SUM(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN store_week.SALES_BASE ELSE 0 END)) * 100 / NULLIF(SUM(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN store_week.SALES_BASE ELSE 0 END), 0), 1)"
+
+  - name: zomato_sales_vs_baseline_pct
+    description: "Zomato sales this week vs the 4-week average on the same days, %. Network total from the view's 'All stores' rows, this week (WEEK_END). Higher is better."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "ROUND((SUM(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN CASE WHEN store_week.CHANNEL = 'Zomato' THEN store_week.SALES_CUR ELSE 0 END ELSE 0 END) - SUM(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN CASE WHEN store_week.CHANNEL = 'Zomato' THEN store_week.SALES_BASE ELSE 0 END ELSE 0 END)) * 100 / NULLIF(SUM(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN CASE WHEN store_week.CHANNEL = 'Zomato' THEN store_week.SALES_BASE ELSE 0 END ELSE 0 END), 0), 1)"
+
+  - name: weekly_complaints
+    description: "Distinct complained orders this week, all platforms. Network total from the view's 'All stores' rows, this week (WEEK_END). Target <= 3. Lower is better."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "MAX(CASE WHEN store_week.MASTER_STORE_ID = 'ALL' THEN store_week.COMPLAINTS_CUR END)"
+
+  - name: zomato_roas
+    description: "Zomato ad sales / ad spend over the latest marketing week (MKT_WEEK_END; marketing lags sales). Network total from the 'All stores' row. Target >= 2.0. Higher is better."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "MAX(CASE WHEN zomato_marketing_week.MASTER_STORE_ID = 'ALL' THEN zomato_marketing_week.ROI_CUR END)"
+
+  - name: zomato_budget_used_pct
+    description: "Zomato ad spend / booked budget over the latest marketing week, %. Network total from the 'All stores' row."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "MAX(CASE WHEN zomato_marketing_week.MASTER_STORE_ID = 'ALL' THEN zomato_marketing_week.BUDGET_USED_CUR END)"
+
+  - name: zomato_menu_to_order_pct
+    description: "Zomato orders / menu opens over the latest marketing week, %. Network total from the 'All stores' row. Higher is better."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "MAX(CASE WHEN zomato_marketing_week.MASTER_STORE_ID = 'ALL' THEN zomato_marketing_week.M2O_CUR END)"
+
+  - name: products_down_vs_baseline
+    description: "Mapped products (4-week average of Rs 1,000 or more) whose sales this week are 15% or more below that average. Lower is better."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "COUNT(DISTINCT CASE WHEN product_week.SKU_ID <> 'UNKNOWN' THEN CASE WHEN product_week.SALES_BASE >= 1000 THEN CASE WHEN product_week.SALES_CUR <= product_week.SALES_BASE * 0.85 THEN product_week.SKU_ID END END END)"
+
+  - name: avg_store_rating
+    description: "Average star rating over the last 30 days of reviews (Zomato). Thin data (~30 reviews a month): read it as a direction. Target >= 4.0. Higher is better."
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: "ROUND(AVG(CASE WHEN CAST(customer_reviews.REVIEW_DATE AS DATE) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) THEN customer_reviews.STAR_RATING END), 2)"
+
+relationships:
+  - name: store_brief_to_store
+    from: store_brief
+    to: dim_store
+    from_columns: [MASTER_STORE_ID]
+    to_columns: [MASTER_STORE_ID]
+
+  - name: store_week_to_store
+    from: store_week
+    to: dim_store
+    from_columns: [MASTER_STORE_ID]
+    to_columns: [MASTER_STORE_ID]
+
+  - name: marketing_week_to_store
+    from: zomato_marketing_week
+    to: dim_store
+    from_columns: [MASTER_STORE_ID]
+    to_columns: [MASTER_STORE_ID]
+
+  - name: reviews_to_store
+    from: customer_reviews
+    to: dim_store
+    from_columns: [MASTER_STORE_ID]
+    to_columns: [MASTER_STORE_ID]
