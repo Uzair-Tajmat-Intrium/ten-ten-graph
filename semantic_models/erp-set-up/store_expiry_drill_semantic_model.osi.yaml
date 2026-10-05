@@ -1,0 +1,59 @@
+# Store-expiry drill model — powers the KPI drill demo (processes/store_expiry_drilldown.yaml).
+# Upload via Connections → Register semantic model (BigQuery connection), NO bindings.
+# Needs V_STORE_STOCK_RISK (sql/views.sql). Keys are declared so a drill joins only onto a unique side.
+version: "1.0"
+name: store_expiry_drill_semantic_model
+description: >-
+  ten-ten dark-store stock risk on each store's latest snapshot, joined to the store
+  master (city, name) and the product master (category, name), so every stock-risk
+  number can be broken down city → store → product. Expired batches are excluded.
+
+datasets:
+  - name: stock_risk
+    description: One row per (store, SKU) with sellable stock on the latest snapshot.
+    source: erp-set-up.bronze.V_STORE_STOCK_RISK
+    primary_key: [STORE_ID, SKU_ID]
+    fields:
+      - {name: STORE_ID, description: Dark-store id, expression: {dialects: [{dialect: ANSI_SQL, expression: STORE_ID}]}}
+      - {name: SKU_ID, description: Product SKU id, expression: {dialects: [{dialect: ANSI_SQL, expression: SKU_ID}]}}
+      - {name: total_available, description: Sellable units on hand, expression: {dialects: [{dialect: ANSI_SQL, expression: total_available}]}}
+      - {name: expiring_qty, description: Units in batches expiring within 3 days, expression: {dialects: [{dialect: ANSI_SQL, expression: expiring_qty}]}}
+      - {name: days_to_expiry, description: Days until the soonest sellable batch expires, expression: {dialects: [{dialect: ANSI_SQL, expression: days_to_expiry}]}}
+      - {name: unit_cogs_inr, description: Unit COGS (INR), expression: {dialects: [{dialect: ANSI_SQL, expression: unit_cogs_inr}]}}
+      - {name: risk_type, description: "wastage, low_stock, critical_low, both or ok", expression: {dialects: [{dialect: ANSI_SQL, expression: risk_type}]}}
+
+  - name: store
+    description: Dark-store master.
+    source: erp-set-up.bronze.MASTER_STORE
+    primary_key: [MASTER_STORE_ID]
+    fields:
+      - {name: MASTER_STORE_ID, description: Store id, expression: {dialects: [{dialect: ANSI_SQL, expression: MASTER_STORE_ID}]}}
+      - {name: STORE_NAME, description: Store name, expression: {dialects: [{dialect: ANSI_SQL, expression: STORE_NAME}]}}
+      - {name: CITY, description: City the store is in, expression: {dialects: [{dialect: ANSI_SQL, expression: CITY}]}}
+      - {name: TYPE, description: Store type, expression: {dialects: [{dialect: ANSI_SQL, expression: TYPE}]}}
+
+  - name: product
+    description: Product master — one row per SKU.
+    source: erp-set-up.ctx_upside_master_data.V_PRODUCT_ENRICHED
+    primary_key: [SKU]
+    fields:
+      - {name: SKU, description: Product SKU id, expression: {dialects: [{dialect: ANSI_SQL, expression: SKU}]}}
+      - {name: DISPLAY_NAME, description: Product name, expression: {dialects: [{dialect: ANSI_SQL, expression: DISPLAY_NAME}]}}
+      - {name: CATEGORY_NAME, description: Product category, expression: {dialects: [{dialect: ANSI_SQL, expression: CATEGORY_NAME}]}}
+      - {name: PRODUCT_LINE_NAME, description: Product line, expression: {dialects: [{dialect: ANSI_SQL, expression: PRODUCT_LINE_NAME}]}}
+
+relationships:
+  - {name: stock_risk_to_store, from: stock_risk, to: store, from_columns: [STORE_ID], to_columns: [MASTER_STORE_ID]}
+  - {name: stock_risk_to_product, from: stock_risk, to: product, from_columns: [SKU_ID], to_columns: [SKU]}
+
+metrics:
+  # Plain SUMs are additive: a drill shows each member's share of its parent.
+  - name: expiring_value_inr
+    description: Near-expiry units priced at unit COGS — rupees about to be binned
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "SUM(stock_risk.expiring_qty * stock_risk.unit_cogs_inr)"}]}
+  - name: expiring_units
+    description: Sellable units in batches expiring within 3 days
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "SUM(stock_risk.expiring_qty)"}]}
+  - name: at_risk_pair_share_pct
+    description: Share of (store, SKU) pairs near expiry or low on stock (%)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "ROUND(SUM(CASE WHEN stock_risk.risk_type <> 'ok' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(stock_risk.STORE_ID), 0), 1)"}]}

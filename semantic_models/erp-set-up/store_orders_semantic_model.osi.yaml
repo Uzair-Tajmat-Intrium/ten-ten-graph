@@ -1,0 +1,50 @@
+# Store orders model — powers the simple KPI drill demo (processes/store_orders_drilldown.yaml).
+# Upload via Connections → Register semantic model (BigQuery connection), NO bindings.
+version: "1.0"
+name: store_orders_semantic_model
+description: >-
+  ten-ten sold orders from the unified order-line table, by store, city, delivery
+  channel and order date. An order is (ORDER_ID, ORDER_DATE): PetPooja reuses
+  invoice numbers across days, so ORDER_ID alone undercounts.
+
+datasets:
+  - name: orders
+    description: One row per order line across PetPooja and UrbanPiper (no unique key).
+    source: erp-set-up.silver.BUSINESS_ANALYTICS
+    fields:
+      - {name: ORDER_ID, description: Source order id (reused across days), expression: {dialects: [{dialect: ANSI_SQL, expression: ORDER_ID}]}}
+      - {name: ORDER_DATE, description: Order date, dimension: {is_time: true}, expression: {dialects: [{dialect: ANSI_SQL, expression: ORDER_DATE}]}}
+      - {name: STORE_ID, description: Store id, expression: {dialects: [{dialect: ANSI_SQL, expression: STORE_ID}]}}
+      - {name: ORDER_STATE, description: "Success, Completed, Cancelled, Dispatched or Food Ready", expression: {dialects: [{dialect: ANSI_SQL, expression: ORDER_STATE}]}}
+      # Source spellings vary (zomato / Zomato_Upside Health VN / ...); fold them to four channels.
+      - name: CHANNEL
+        description: Delivery channel — Zomato, Swiggy, Toing or POS
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: >-
+                CASE WHEN LOWER(CHANNEL) IN ('zomato', 'zomato_upside health vn') THEN 'Zomato'
+                WHEN LOWER(CHANNEL) IN ('swiggy', 'swiggy_viman nagar uh', 'swiggy_mithai') THEN 'Swiggy'
+                WHEN LOWER(CHANNEL) = 'toing by swiggy' THEN 'Toing' ELSE CHANNEL END
+
+  - name: store
+    description: Store master — one canonical name per store id.
+    source: erp-set-up.bronze.MASTER_STORE
+    primary_key: [MASTER_STORE_ID]
+    fields:
+      - {name: MASTER_STORE_ID, description: Store id, expression: {dialects: [{dialect: ANSI_SQL, expression: MASTER_STORE_ID}]}}
+      - {name: STORE_NAME, description: Store name, expression: {dialects: [{dialect: ANSI_SQL, expression: STORE_NAME}]}}
+      - {name: CITY, description: City the store is in, expression: {dialects: [{dialect: ANSI_SQL, expression: CITY}]}}
+
+relationships:
+  - {name: orders_to_store, from: orders, to: store, from_columns: [STORE_ID], to_columns: [MASTER_STORE_ID]}
+
+metrics:
+  - name: order_count
+    description: Sold orders (Success or Completed), counted once per (ORDER_ID, ORDER_DATE)
+    expression:
+      dialects:
+        - dialect: ANSI_SQL
+          expression: >-
+            COUNT(DISTINCT CASE WHEN orders.ORDER_STATE IN ('Success', 'Completed')
+            THEN CONCAT(orders.ORDER_ID, '|', CAST(orders.ORDER_DATE AS STRING)) END)

@@ -1,0 +1,52 @@
+# Marketing performance semantic model — upload via Connections → Register semantic
+# model (BigQuery connection), with NO dataset/relationship bindings.
+# Metrics cover the LAST 3 COMPLETE MONTHS, so the goal, the entity page and a KPI
+# drill all read the same number. Drillable by store (via the join) and ad type.
+version: "1.0"
+name: marketing_performance_semantic_model
+description: >-
+  ten-ten Zomato/Swiggy ad performance: one row per campaign per calendar month with
+  spend, attributed sales, orders, impressions and clicks, joined to the dark store
+  it ran for. Live data in erp-set-up.bronze.
+
+datasets:
+  - name: campaign
+    description: One row per (campaign, calendar month) — ad spend and the sales it drove.
+    source: erp-set-up.bronze.V_STORE_CAMPAIGN_HISTORY
+    primary_key: [CAMPAIGN_ID, MONTH]
+    fields:
+      - {name: CAMPAIGN_ID, expression: {dialects: [{dialect: ANSI_SQL, expression: CAMPAIGN_ID}]}}
+      - {name: MONTH, description: Calendar month of the spend, dimension: {is_time: true}, expression: {dialects: [{dialect: ANSI_SQL, expression: MONTH}]}}
+      - {name: MASTER_STORE_ID, description: Dark store the campaign ran for, expression: {dialects: [{dialect: ANSI_SQL, expression: MASTER_STORE_ID}]}}
+      - {name: PLATFORM, description: Ad platform (ZOMATO / SWIGGY), expression: {dialects: [{dialect: ANSI_SQL, expression: PLATFORM}]}}
+      - {name: PRODUCT_TYPE, description: "Ad type — PSP, Visit Pack, Visit Pack Plus, Branding on search", expression: {dialects: [{dialect: ANSI_SQL, expression: PRODUCT_TYPE}]}}
+      - {name: TARGETING, description: Audience targeting used, expression: {dialects: [{dialect: ANSI_SQL, expression: TARGETING}]}}
+      - {name: SEGMENTS, expression: {dialects: [{dialect: ANSI_SQL, expression: SEGMENTS}]}}
+      - {name: AD_SPEND_RS, description: Ad spend (INR), expression: {dialects: [{dialect: ANSI_SQL, expression: AD_SPEND_RS}]}}
+      - {name: AD_SALES_RS, description: Sales attributed to the ad (INR), expression: {dialects: [{dialect: ANSI_SQL, expression: AD_SALES_RS}]}}
+      - {name: AD_ORDERS, expression: {dialects: [{dialect: ANSI_SQL, expression: AD_ORDERS}]}}
+      - {name: AD_IMPRESSIONS, expression: {dialects: [{dialect: ANSI_SQL, expression: AD_IMPRESSIONS}]}}
+      - {name: AD_CLICKS, expression: {dialects: [{dialect: ANSI_SQL, expression: AD_CLICKS}]}}
+
+  - name: store
+    description: Dark-store master.
+    source: erp-set-up.bronze.MASTER_STORE
+    primary_key: [MASTER_STORE_ID]
+    fields:
+      - {name: MASTER_STORE_ID, expression: {dialects: [{dialect: ANSI_SQL, expression: MASTER_STORE_ID}]}}
+      - {name: STORE_NAME, expression: {dialects: [{dialect: ANSI_SQL, expression: STORE_NAME}]}}
+      - {name: CITY, expression: {dialects: [{dialect: ANSI_SQL, expression: CITY}]}}
+
+relationships:
+  - {name: campaign_to_store, from: campaign, to: store, from_columns: [MASTER_STORE_ID], to_columns: [MASTER_STORE_ID]}
+
+metrics:
+  - name: ad_roi_3m
+    description: Ad-attributed sales per rupee of ad spend, last 3 complete months
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "ROUND(SUM(CASE WHEN DATE_DIFF(CURRENT_DATE(), campaign.MONTH, MONTH) BETWEEN 1 AND 3 THEN campaign.AD_SALES_RS ELSE 0 END) / NULLIF(SUM(CASE WHEN DATE_DIFF(CURRENT_DATE(), campaign.MONTH, MONTH) BETWEEN 1 AND 3 THEN campaign.AD_SPEND_RS ELSE 0 END), 0), 2)"}]}
+  - name: ad_spend_3m_inr
+    description: Ad spend, last 3 complete months (INR)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "SUM(CASE WHEN DATE_DIFF(CURRENT_DATE(), campaign.MONTH, MONTH) BETWEEN 1 AND 3 THEN campaign.AD_SPEND_RS ELSE 0 END)"}]}
+  - name: zero_return_ad_spend_3m_inr
+    description: Ad spend on campaign-months that drove no sales at all, last 3 complete months (INR)
+    expression: {dialects: [{dialect: ANSI_SQL, expression: "SUM(CASE WHEN DATE_DIFF(CURRENT_DATE(), campaign.MONTH, MONTH) BETWEEN 1 AND 3 AND campaign.AD_SALES_RS = 0 THEN campaign.AD_SPEND_RS ELSE 0 END)"}]}
